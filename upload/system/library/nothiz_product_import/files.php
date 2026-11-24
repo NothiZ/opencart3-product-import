@@ -1,0 +1,592 @@
+<?php
+
+class NothizProductImportFiles {
+    private const SHEET_NS = [
+        'http://schemas.openxmlformats.org/spreadsheetml/2006/main',
+        'http://purl.oclc.org/ooxml/spreadsheetml/main',
+    ];
+    private const OFFICE_REL_NS = [
+        'http://schemas.openxmlformats.org/officeDocument/2006/relationships',
+        'http://purl.oclc.org/ooxml/officeDocument/relationships',
+    ];
+    private const PACKAGE_REL_NS = [
+        'http://schemas.openxmlformats.org/package/2006/relationships',
+        'http://purl.oclc.org/ooxml/package/relationships',
+    ];
+    private const IMAGE_TYPES = [
+        'jpg' => IMAGETYPE_JPEG,
+        'jpeg' => IMAGETYPE_JPEG,
+        'png' => IMAGETYPE_PNG,
+        'webp' => IMAGETYPE_WEBP,
+    ];
+    private const XML_BYTES = 8 * 1024 * 1024;
+    private const IMAGE_BYTES = 15 * 1024 * 1024;
+    public const WORKBOOK_BYTES = 24 * 1024 * 1024;
+    public const IMAGE_ARCHIVE_BYTES = 320 * 1024 * 1024;
+    private const EXPANDED_IMAGE_ARCHIVE_BYTES = 768 * 1024 * 1024;
+    public const IMPORT_IMAGE_PATH = 'catalog/nothiz_product_import';
+
+    // Workbook reading
+
+    /** @return array<int, array{row:int, data:array<string, string>}> */
+    public static function readWorkbook(string $path): array {
+        if (!class_exists('DOMDocument')) {
+            throw new RuntimeException('The PHP DOM extension is required.');
+        }
+        $zip = self::openArchive($path, self::WORKBOOK_BYTES);
+        try {
+            $workbookPath = 'xl/workbook.xml';
+            if ($zip->locateName('_rels/.rels') !== false) {
+                $packageRelationships = self::relationships(self::xml($zip, '_rels/.rels', 'Relationships', self::PACKAGE_REL_NS), '');
+                foreach ($packageRelationships as $relationship) {
+                    if ($relationship['type'] === 'officeDocument') {
+                        $workbookPath = $relationship['path'];
+                        break;
+                    }
+                }
+            }
+
+            $workbook = self::xml($zip, $workbookPath, 'workbook', self::SHEET_NS);
+            $sheets = self::firstChild($workbook, 'sheets');
+            $sheet = $sheets ? self::firstChild($sheets, 'sheet') : null;
+            if (!$sheet) {
+                throw new RuntimeException('The workbook does not contain a worksheet.');
+            }
+
+            $sheetId = '';
+            foreach (self::OFFICE_REL_NS as $namespace) {
+                $sheetId = $sheet->getAttributeNS($namespace, 'id');
+                if ($sheetId !== '') {
+                    break;
+                }
+            }
+            $directory = dirname($workbookPath);
+            $relationshipPath = ($directory === '.' ? '' : $directory . '/') . '_rels/' . basename($workbookPath) . '.rels';
+            $relationships = self::relationships(self::xml($zip, $relationshipPath, 'Relationships', self::PACKAGE_REL_NS), $workbookPath);
+            if (!isset($relationships[$sheetId]) || $relationships[$sheetId]['type'] !== 'worksheet') {
+                throw new RuntimeException('The first workbook sheet must point to a worksheet inside the XLSX file.');
+            }
+
+            unset($workbook, $sheets, $sheet);
+            $strings = [];
+            foreach ($relationships as $relationship) {
+                if ($relationship['type'] === 'sharedStrings') {
+                    $shared = self::xml($zip, $relationship['path'], 'sst', self::SHEET_NS);
+                    foreach (self::children($shared, 'si') as $item) {
+                        $strings[] = self::textRuns($item);
+                    }
+                    unset($shared, $item);
+                    break;
+                }
+            }
+
+            $worksheet = self::xml($zip, $relationships[$sheetId]['path'], 'worksheet', self::SHEET_NS);
+            $sheetData = self::firstChild($worksheet, 'sheetData');
+            if (!$sheetData) {
+                throw new RuntimeException('The first worksheet is missing its row data.');
+            }
+            return self::workbookRows($sheetData, $strings);
+        } finally {
+            $zip->close();
+        }
+    }
+
+    private static function workbookRows(DOMElement $sheetData, array $strings): array {
+        $headers = [];
+        $defaults = [];
+        $rows = [];
+        $previousRow = 0;
+        $cellBytes = 0;
+        foreach (self::children($sheetData, 'row') as $element) {
+            $r = $element->getAttribute('r');
+            $row = $r === '' ? $previousRow + 1 : (int)$r;
+            if (($r !== '' && !preg_match('/^[1-9][0-9]{0,6}$/D', $r)) || $row <= $previousRow || $row > 1048576) {
+                throw new RuntimeException('The first worksheet contains an invalid row reference.');
+            }
+            $previousRow = $row;
+            if ($row !== 1 && !$headers) {
+                break;
+            }
+
+            $column = 0;
+            $data = $defaults;
+            $hasValues = false;
+            foreach (self::children($element, 'c') as $cell) {
+                $column = self::cellColumn($cell, $row, $column);
+                if ($row !== 1 && !isset($headers[$column])) {
+                    continue;
+                }
+
+                $value = self::cellText($cell, $strings);
+                $cellBytes += strlen($value);
+                if (strlen($value) > 128 * 1024 || $cellBytes > 16 * 1024 * 1024) {
+                    throw new RuntimeException('The worksheet exceeds the maximum cell text size.');
+                }
+
+                if ($row === 1) {
+                    $header = strtolower(trim($value));
+                    if ($header !== '') {
+                        if (in_array($header, $headers, true) || count($headers) >= 256) {
+                            throw new RuntimeException('Worksheet headers must be unique and there may be at most 256.');
+                        }
+                        $headers[$column] = $header;
+                    }
+                } else {
+                    $data[$headers[$column]] = $value;
+                    $hasValues = $hasValues || trim($value) !== '';
+                }
+            }
+
+            if ($row === 1) {
+                self::requireHeaders($headers);
+                $defaults = array_fill_keys($headers, '');
+            } elseif ($hasValues) {
+                if (count($rows) >= 10000) {
+                    throw new RuntimeException('A workbook may contain at most 10,000 product rows.');
+                }
+                // Each returned row has entries for all headers, including sparse worksheet cells.
+                if (count($rows) >= intdiv(250000, count($headers))) {
+                    throw new RuntimeException('The workbook may contain at most 250,000 expanded cells.');
+                }
+                $rows[] = ['row' => $row, 'data' => $data];
+            }
+        }
+        if (!$headers) {
+            self::requireHeaders($headers);
+        }
+        return $rows;
+    }
+
+    private static function requireHeaders(array $headers): void {
+        $missing = array_diff(['sku', 'title', 'price', 'description'], $headers);
+        if ($missing) {
+            throw new RuntimeException('The first worksheet is missing required headers: ' . implode(', ', $missing) . '.');
+        }
+    }
+
+    private static function cellColumn(DOMElement $cell, int $row, int $previous): int {
+        $reference = $cell->getAttribute('r');
+        $column = $previous + 1;
+        if ($reference !== '') {
+            if (!preg_match('/^([A-Z]{1,3})([1-9][0-9]{0,6})$/D', $reference, $matches) || (int)$matches[2] !== $row) {
+                throw new RuntimeException('Invalid cell reference in worksheet row ' . $row . '.');
+            }
+            $column = 0;
+            foreach (str_split($matches[1]) as $letter) {
+                $column = $column * 26 + ord($letter) - 64;
+            }
+        }
+        if ($column <= $previous || $column > 16384) {
+            throw new RuntimeException('Invalid column order in worksheet row ' . $row . '.');
+        }
+        return $column;
+    }
+
+    private static function cellText(DOMElement $cell, array $strings): string {
+        $type = $cell->getAttribute('t');
+        if ($type === 'inlineStr') {
+            $inline = self::firstChild($cell, 'is');
+            return $inline ? self::textRuns($inline) : '';
+        }
+        // Excel stores the last calculated value in v, including for formula cells.
+        $value = self::firstChild($cell, 'v');
+        if (!$value) {
+            return '';
+        }
+        if ($type === 's') {
+            $index = $value->textContent;
+            if (!preg_match('/^[0-9]{1,7}$/D', $index) || !isset($strings[(int)$index])) {
+                throw new RuntimeException('The workbook contains an invalid shared string reference.');
+            }
+            return $strings[(int)$index];
+        }
+        return $value->textContent;
+    }
+
+    private static function textRuns(DOMElement $element): string {
+        $plain = self::firstChild($element, 't');
+        if ($plain) {
+            return $plain->textContent;
+        }
+        $text = '';
+        foreach (self::children($element, 'r') as $run) {
+            $part = self::firstChild($run, 't');
+            if ($part) {
+                $text .= $part->textContent;
+            }
+        }
+        return $text;
+    }
+
+    private static function children(DOMElement $parent, string $name): iterable {
+        foreach ($parent->childNodes as $node) {
+            if ($node instanceof DOMElement && $node->localName === $name && $node->namespaceURI === $parent->namespaceURI) {
+                yield $node;
+            }
+        }
+    }
+
+    private static function firstChild(DOMElement $parent, string $name): ?DOMElement {
+        foreach (self::children($parent, $name) as $child) {
+            return $child;
+        }
+        return null;
+    }
+
+    private static function relationships(DOMElement $xml, string $source): array {
+        $relationships = [];
+        foreach (self::children($xml, 'Relationship') as $element) {
+            if ($element->getAttribute('TargetMode') === 'External') {
+                continue;
+            }
+            $type = $element->getAttribute('Type');
+            $name = substr($type, strrpos($type, '/') + 1);
+            if (!in_array(dirname($type), self::OFFICE_REL_NS, true) || !in_array($name, ['officeDocument', 'worksheet', 'sharedStrings'], true)) {
+                continue;
+            }
+            $id = $element->getAttribute('Id');
+            if ($id === '' || isset($relationships[$id])) {
+                throw new RuntimeException('The workbook contains an invalid OOXML relationship ID.');
+            }
+            $relationships[$id] = ['type' => $name, 'path' => self::resolvePart($source, $element->getAttribute('Target'))];
+        }
+        return $relationships;
+    }
+
+    private static function resolvePart(string $source, string $target): string {
+        if ($target === '' || strpbrk($target, '?#') !== false) {
+            throw new RuntimeException('The workbook contains an invalid OOXML relationship target.');
+        }
+        $target = rawurldecode($target);
+        $directory = $source === '' ? '.' : dirname($source);
+        $parts = $target[0] === '/' || $directory === '.' ? [] : explode('/', $directory);
+        foreach (explode('/', $target[0] === '/' ? substr($target, 1) : $target) as $part) {
+            if ($part === '.' || ($part === '..' && $parts)) {
+                if ($part === '..') {
+                    array_pop($parts);
+                }
+                continue;
+            }
+            self::assertPathPart($part);
+            $parts[] = $part;
+        }
+        if (!$parts) {
+            throw new RuntimeException('The workbook contains an empty OOXML relationship target.');
+        }
+        return implode('/', $parts);
+    }
+
+    private static function xml(ZipArchive $zip, string $path, string $root, array $namespaces): DOMElement {
+        $index = $zip->locateName($path);
+        if ($index === false) {
+            throw new RuntimeException('The XLSX file is missing a required part: ' . $root . '.');
+        }
+        $xml = self::member($zip, $index, self::XML_BYTES);
+        $doc = new DOMDocument();
+        // Avoid loading external resources or expanding entities in uploaded XML.
+        if (!$doc->loadXML($xml, LIBXML_NONET | LIBXML_NOERROR | LIBXML_NOWARNING | LIBXML_COMPACT)
+            || $doc->doctype !== null || !$doc->documentElement || $doc->documentElement->localName !== $root
+            || !in_array($doc->documentElement->namespaceURI, $namespaces, true)) {
+            throw new RuntimeException('The XLSX file contains an invalid XML part: ' . $root . '.');
+        }
+        return $doc->documentElement;
+    }
+
+    // Image archive inspection
+
+    /** @return array<string, array{categories:string[], entries:string[]}> */
+    public static function inspectImages(string $path): array {
+        $zip = self::openArchive($path, self::IMAGE_ARCHIVE_BYTES);
+        try {
+            $files = [];
+            $seenNames = [];
+            $totalBytes = 0;
+            for ($index = 0; $index < $zip->numFiles; $index++) {
+                $stat = self::stat($zip, $index);
+                $name = $stat['name'];
+                $directory = substr($name, -1) === '/';
+                $parts = explode('/', $directory ? substr($name, 0, -1) : $name);
+                if (strlen($name) > 1000) {
+                    throw new RuntimeException('An archive path exceeds the maximum length.');
+                }
+                foreach ($parts as $part) {
+                    self::assertPathPart($part);
+                }
+
+                $totalBytes += $stat['size'];
+                if ($stat['size'] > self::IMAGE_BYTES || $totalBytes > self::EXPANDED_IMAGE_ARCHIVE_BYTES) {
+                    throw new RuntimeException('The image ZIP exceeds the maximum expanded size.');
+                }
+                $fileName = end($parts);
+                if ($directory || $parts[0] === '__MACOSX' || in_array($fileName, ['.DS_Store', 'Thumbs.db', 'desktop.ini'], true)
+                    || strpos($fileName, '._') === 0) {
+                    continue;
+                }
+
+                if (isset($seenNames[$name])) {
+                    throw new RuntimeException('The image ZIP repeats an image path.');
+                }
+                $seenNames[$name] = true;
+                self::image($zip, $index, $stat);
+                $files[] = ['name' => $name, 'parts' => $parts];
+            }
+            if (!$files) {
+                throw new RuntimeException('The image ZIP does not contain any supported images.');
+            }
+
+            $prefixLength = self::imagePrefixLength($files);
+            $images = [];
+            $folders = [];
+            foreach ($files as $file) {
+                $parts = array_slice($file['parts'], $prefixLength);
+                if (count($parts) !== 3 && count($parts) !== 4) {
+                    throw new RuntimeException('Use category/SKU/image or parent/child/SKU/image folders in the image ZIP.');
+                }
+                array_pop($parts);
+                $sku = array_pop($parts);
+                if (isset($folders[$sku]) && $folders[$sku] !== $parts) {
+                    throw new RuntimeException('The image ZIP contains the same SKU in multiple folders: ' . $sku . '.');
+                }
+                $folders[$sku] = $parts;
+                $images[$sku]['categories'] = $parts;
+                $images[$sku]['entries'][] = $file['name'];
+                if (count($images[$sku]['entries']) > 100) {
+                    throw new RuntimeException('The image ZIP may contain at most 100 images per SKU.');
+                }
+            }
+            foreach ($images as &$item) {
+                sort($item['entries'], SORT_STRING);
+            }
+            unset($item);
+            return $images;
+        } finally {
+            $zip->close();
+        }
+    }
+
+    private static function imagePrefixLength(array $files): int {
+        // Strip a common wrapper only when the raw image paths cannot already form valid SKU folders.
+        $validRawPaths = true;
+        foreach ($files as $file) {
+            if (count($file['parts']) > 4) {
+                $validRawPaths = false;
+                break;
+            }
+        }
+        if ($validRawPaths) {
+            return 0;
+        }
+        foreach ([['catalog', 'products'], ['products']] as $prefix) {
+            $length = count($prefix);
+            foreach ($files as $file) {
+                if (array_slice($file['parts'], 0, $length) !== $prefix
+                    || !in_array(count($file['parts']) - $length, [3, 4], true)) {
+                    continue 2;
+                }
+            }
+            return $length;
+        }
+        return 0;
+    }
+
+    private static function image(ZipArchive $zip, int $index, array $stat): array {
+        $extension = strtolower(pathinfo($stat['name'], PATHINFO_EXTENSION));
+        if (!isset(self::IMAGE_TYPES[$extension])) {
+            throw new RuntimeException('The image ZIP may contain only JPG, JPEG, PNG or WebP images.');
+        }
+        if ($extension === 'webp' && defined('VERSION') && version_compare(VERSION, '3.0.3.9', '<')) {
+            throw new RuntimeException('Convert WebP images to JPG or PNG for OpenCart versions before 3.0.3.9.');
+        }
+        $bytes = self::member($zip, $index, self::IMAGE_BYTES, $stat);
+        $image = @getimagesizefromstring($bytes);
+        if (!$image || $image[2] !== self::IMAGE_TYPES[$extension] || $image[0] < 1 || $image[1] < 1
+            || $image[0] > intdiv(16000000, $image[1])) {
+            throw new RuntimeException('Invalid image type or dimensions: ' . $stat['name'] . '.');
+        }
+        // A valid header can still precede truncated image data. Decode before it reaches OpenCart's resizer.
+        if (!function_exists('imagecreatefromstring') || @imagecreatefromstring($bytes) === false) {
+            throw new RuntimeException('The image could not be decoded by PHP GD: ' . $stat['name'] . '.');
+        }
+        return [$extension, $bytes];
+    }
+
+    // Publishing and rollback
+
+    /** @return string[] Paths relative to the OpenCart image directory. */
+    public static function publishImages(string $zipPath, array $entries, string $imageRoot, string $jobId, int $row): array {
+        if (!$entries || count($entries) > 100) {
+            throw new RuntimeException('Invalid list of images to publish.');
+        }
+        $relative = self::imageDestination($jobId, $row);
+        $imageRoot = realpath($imageRoot);
+        if ($imageRoot === false || !is_dir($imageRoot)) {
+            throw new RuntimeException('The OpenCart image directory is unavailable.');
+        }
+        $zip = self::openArchive($zipPath, self::IMAGE_ARCHIVE_BYTES);
+        $paths = [];
+        $rowDirectory = '';
+        try {
+            $directory = $imageRoot;
+            foreach (explode('/', dirname($relative)) as $part) {
+                $directory .= '/' . $part;
+                if (is_link($directory) || (!is_dir($directory) && !@mkdir($directory, 0755) && !is_dir($directory))) {
+                    throw new RuntimeException('Unable to create the import image directory.');
+                }
+            }
+            if (!@mkdir($directory . '/' . $row, 0755)) {
+                throw new RuntimeException('The import image folder already exists or could not be created.');
+            }
+            $rowDirectory = $directory . '/' . $row;
+
+            // Use generated filenames and exclusive writes instead of extracting ZIP paths into the web root.
+            foreach (array_values($entries) as $number => $entry) {
+                $index = $zip->locateName($entry);
+                if ($index === false) {
+                    throw new RuntimeException('An image selected for import is missing from the ZIP.');
+                }
+                list($extension, $bytes) = self::image($zip, $index, self::stat($zip, $index));
+                $fileName = ($number + 1) . '.' . $extension;
+                $file = @fopen($rowDirectory . '/' . $fileName, 'xb');
+                if (!$file) {
+                    throw new RuntimeException('Unable to create the import image file.');
+                }
+                $paths[] = $relative . '/' . $fileName;
+                $length = @fwrite($file, $bytes);
+                $closed = @fclose($file);
+                if ($length !== strlen($bytes) || !$closed) {
+                    throw new RuntimeException('Unable to write the complete import image file.');
+                }
+            }
+            return $paths;
+        } catch (Throwable $error) {
+            self::discardImages($paths, $imageRoot);
+            if ($rowDirectory !== '') {
+                @rmdir($rowDirectory);
+            }
+            throw $error;
+        } finally {
+            $zip->close();
+        }
+    }
+
+    /**
+     * Remove files left by an interrupted attempt after the caller has checked the SKU under its database lock.
+     */
+    public static function discardRowImages(string $imageRoot, string $jobId, int $row): void {
+        $relative = self::imageDestination($jobId, $row);
+        $directory = realpath($imageRoot);
+        if ($directory === false || !is_dir($directory)) {
+            throw new RuntimeException('The OpenCart image directory is unavailable.');
+        }
+        foreach (explode('/', $relative) as $part) {
+            $directory .= '/' . $part;
+            if (is_link($directory) || (file_exists($directory) && !is_dir($directory))) {
+                throw new RuntimeException('The prior import image path contains an unexpected entry.');
+            }
+            if (!is_dir($directory)) {
+                return;
+            }
+        }
+
+        // Validate the whole folder before deleting anything so unrelated files are preserved.
+        $files = [];
+        foreach (new FilesystemIterator($directory) as $file) {
+            if ($file->isLink() || !$file->isFile() || !preg_match('/^([1-9][0-9]?|100)\.(?:jpe?g|png|webp)$/D', $file->getFilename(), $match)
+                || isset($files[$match[1]])) {
+                throw new RuntimeException('The prior import image folder contains an unexpected entry.');
+            }
+            $files[$match[1]] = $file->getPathname();
+        }
+        foreach ($files as $path) {
+            if (!@unlink($path)) {
+                throw new RuntimeException('Unable to remove an image left by an interrupted import.');
+            }
+        }
+        if (!@rmdir($directory)) {
+            throw new RuntimeException('Unable to remove an image folder left by an interrupted import.');
+        }
+    }
+
+    private static function imageDestination(string $jobId, int $row): string {
+        if (!preg_match('/^[a-f0-9]{32}$/D', $jobId) || $row < 1 || $row > 1048576) {
+            throw new RuntimeException('Invalid import image destination.');
+        }
+        return self::IMPORT_IMAGE_PATH . '/' . $jobId . '/' . $row;
+    }
+
+    public static function discardImages(array $paths, string $imageRoot): void {
+        $root = realpath($imageRoot);
+        if ($root === false) {
+            return;
+        }
+        $directories = [];
+        foreach ($paths as $path) {
+            if (!preg_match('#^catalog/nothiz_product_import/[a-f0-9]{32}/[1-9][0-9]*/[1-9][0-9]*\.(?:jpe?g|png|webp)$#D', $path)) {
+                continue;
+            }
+            $directory = $root;
+            foreach (explode('/', dirname($path)) as $part) {
+                $directory .= '/' . $part;
+                if (is_link($directory)) {
+                    continue 2;
+                }
+            }
+            @unlink($root . '/' . $path);
+            $directories[$directory] = true;
+        }
+        foreach ($directories as $directory => $unused) {
+            @rmdir($directory);
+        }
+    }
+
+    // Shared archive validation
+
+    private static function openArchive(string $path, int $maxBytes): ZipArchive {
+        if (!class_exists('ZipArchive')) {
+            throw new RuntimeException('The PHP ZIP extension is required.');
+        }
+        $size = @filesize($path);
+        if ($size === false || $size < 1 || $size > $maxBytes) {
+            throw new RuntimeException('The archive is unreadable, empty, or exceeds the maximum upload size.');
+        }
+        $zip = new ZipArchive();
+        if (@$zip->open($path, ZipArchive::CHECKCONS) !== true) {
+            throw new RuntimeException('Unable to open the ZIP or XLSX file.');
+        }
+        if ($zip->numFiles < 1 || $zip->numFiles > 10000) {
+            $zip->close();
+            throw new RuntimeException('The archive must contain between 1 and 10,000 entries.');
+        }
+        return $zip;
+    }
+
+    private static function stat(ZipArchive $zip, int $index): array {
+        $stat = $zip->statIndex($index);
+        $system = $mode = 0;
+        if (!$stat || $stat['size'] < 0 || !empty($stat['encryption_method'])
+            || ($zip->getExternalAttributesIndex($index, $system, $mode) && $system === 3
+                && !in_array(($mode >> 16) & 0170000, [0, 0040000, 0100000], true))) {
+            throw new RuntimeException('The archive contains an encrypted, linked, or invalid entry.');
+        }
+        return $stat;
+    }
+
+    private static function member(ZipArchive $zip, int $index, int $maxBytes, ?array $stat = null): string {
+        $stat = $stat ?? self::stat($zip, $index);
+        if ($stat['size'] < 1 || $stat['size'] > $maxBytes) {
+            throw new RuntimeException('An archive entry is empty or exceeds the maximum expanded size.');
+        }
+        $bytes = @$zip->getFromIndex($index, $stat['size'] + 1);
+        if ($bytes === false || strlen($bytes) !== $stat['size']) {
+            throw new RuntimeException('An archive entry could not be read completely.');
+        }
+        return $bytes;
+    }
+
+    private static function assertPathPart(string $part): void {
+        if ($part === '' || $part === '.' || $part === '..' || strlen($part) > 255
+            || !preg_match('//u', $part) || preg_match('/[\x00-\x1f\x7f\\\\:]/', $part)) {
+            throw new RuntimeException('The archive contains an unsafe path.');
+        }
+    }
+}
