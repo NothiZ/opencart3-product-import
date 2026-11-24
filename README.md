@@ -37,6 +37,17 @@
 
 在此目录运行 `python build.py`，生成后台安装器可上传的 `nothiz_product_import_oc3.ocmod.zip`。也可以使用 `python build.py /path/to/nothiz_product_import_oc3.ocmod.zip` 指定输出位置。
 
+## 自动测试与发布
+
+推送分支时，[GitHub Actions](https://github.com/NothiZ/opencart3-product-import/actions) 会运行 `tests/` 中的全部 PHP 测试。
+
+发布新版本时，推送一个 `vX.Y.Z` 格式的标签。工作流会先运行测试，通过后构建安装包并上传到 Releases。比如发布 `v1.0.1`：
+
+```bash
+git tag v1.0.1
+git push origin v1.0.1
+```
+
 ## 许可证
 
 项目采用 [MIT 许可证](LICENSE)。随插件提供的第三方库保留各自的许可证。
