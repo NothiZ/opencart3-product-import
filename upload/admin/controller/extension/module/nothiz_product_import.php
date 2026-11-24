@@ -7,6 +7,7 @@ class ControllerExtensionModuleNothizProductImport extends Controller {
     private const SESSION_JOB = 'nothiz_product_import_job';
     private const SESSION_UPLOAD = 'nothiz_product_import_upload';
     private const JOB_AGE = 86400;
+    private const ARCHIVE_SCAN_VERSION = 2;
     private const REUSE_META = 'reused-images.json';
     private const TEMP_FILES = [
         'workbook.xlsx', 'workbook.xlsx.ranges', 'workbook.xlsx.ranges.tmp', 'images.zip',
@@ -83,8 +84,9 @@ class ControllerExtensionModuleNothizProductImport extends Controller {
             'pause_url' => $this->link(self::ROUTE . '/pauseImport'),
             'scan_url' => $this->link(self::ROUTE . '/checkArchive'),
             'pending_scan' => $pendingScan,
-            'outer_products' => !empty($job['outer_products']),
-            'strip_products' => !empty($job['strip_products']),
+            'outer_folder' => $job['outer_folder'] ?? (!empty($job['outer_products']) ? 'products' : null),
+            'ignore_outer_folder' => $job['ignore_outer_folder'] ?? !empty($job['strip_products']),
+            'upload_ignore_outer_folder' => $pendingScan !== '' && !empty($pending['ignore_outer_folder']),
             'warnings' => array_map(function ($issue) { return $this->issueText($issue); }, $job['warnings'] ?? []),
             'report_url' => $this->link(self::ROUTE . '/report'),
             'products_url' => $this->user->hasPermission('access', 'catalog/product') ? $this->link('catalog/product') : '',
@@ -348,6 +350,7 @@ class ControllerExtensionModuleNothizProductImport extends Controller {
         $upload = [
             'id' => bin2hex(random_bytes(16)),
             'expires' => time() + self::JOB_AGE,
+            'ignore_outer_folder' => ($this->request->post['ignore_outer_folder'] ?? '') === '1',
             'files' => [],
         ];
         $limits = [
@@ -522,12 +525,13 @@ class ControllerExtensionModuleNothizProductImport extends Controller {
         try {
             $this->requireImportReaders();
             $recheck = isset($this->request->post['job']);
-            $strip = $recheck && ($this->request->post['strip_products'] ?? '') === '1';
             if ($recheck) {
                 $jobId = $this->requestJobId();
+                $strip = ($this->request->post['ignore_outer_folder'] ?? $this->request->post['strip_products'] ?? '') === '1';
             } else {
                 $upload = $this->stagedUpload($this->request->post['upload'] ?? '');
                 $jobId = $upload['id'];
+                $strip = !empty($upload['ignore_outer_folder']);
             }
             $directory = $this->jobDirectory($jobId);
             $lock = $this->lockUpload($directory, true);
@@ -540,7 +544,7 @@ class ControllerExtensionModuleNothizProductImport extends Controller {
                 $archive = $directory . '/images.zip';
                 if ($recheck) {
                     $job = $this->readJob($jobId);
-                    if ($this->summary($job)['started'] || empty($job['outer_products'])
+                    if ($this->summary($job)['started'] || (!isset($job['outer_folder']) && empty($job['outer_products']))
                         || !is_file($archive) || !is_file($directory . '/workbook.xlsx')) {
                         throw new RuntimeException($this->language->get('error_job'));
                     }
@@ -554,12 +558,12 @@ class ControllerExtensionModuleNothizProductImport extends Controller {
                     if (!$recheck) {
                         $this->verifyArchiveUpload($upload, $directory);
                     }
-                    $saved = ['strip' => $strip, 'state' => null];
+                    $saved = ['version' => self::ARCHIVE_SCAN_VERSION, 'strip' => $strip, 'state' => null];
                     $this->writeState($directory . '/archive-scan.json', $saved);
                 }
 
                 if (empty($saved['done'])) {
-                    $saved = NothizProductImportFiles::scanImages($archive, $saved['state'], DIR_IMAGE, $strip) + ['strip' => $strip];
+                    $saved = NothizProductImportFiles::scanImages($archive, $saved['state'], DIR_IMAGE, $strip) + ['version' => self::ARCHIVE_SCAN_VERSION, 'strip' => $strip];
                     $this->writeState($directory . '/archive-scan.json', $saved);
                 }
                 if ($recheck && $saved['done']) {
@@ -600,7 +604,8 @@ class ControllerExtensionModuleNothizProductImport extends Controller {
     private function readScan(string $directory): ?array {
         $content = @file_get_contents($directory . '/archive-scan.json');
         $scan = $content === false ? null : json_decode($content, true);
-        return is_array($scan) && isset($scan['strip']) && array_key_exists('state', $scan) ? $scan : null;
+        return is_array($scan) && ($scan['version'] ?? null) === self::ARCHIVE_SCAN_VERSION
+            && isset($scan['strip']) && array_key_exists('state', $scan) ? $scan : null;
     }
 
     private function applyArchiveIndex(array &$job, array $rows, array $scan): void {
@@ -610,8 +615,9 @@ class ControllerExtensionModuleNothizProductImport extends Controller {
             $rows, $index['groups'], true, $index['issues']
         );
         $job['cursor'] = $this->summary($job)['ready'] ? 0 : count($job['items']);
-        $job['outer_products'] = $index['outer_products'];
-        $job['strip_products'] = $scan['strip'];
+        unset($job['outer_products'], $job['strip_products']);
+        $job['outer_folder'] = $index['outer_folder'];
+        $job['ignore_outer_folder'] = $scan['strip'];
         $job['warnings'] = $index['warnings'];
     }
 
@@ -657,7 +663,7 @@ class ControllerExtensionModuleNothizProductImport extends Controller {
             foreach (['workbook.xlsx.ranges', 'images.zip.ranges', self::REUSE_META, 'archive-scan.json'] as $entry) {
                 @unlink($directory . '/' . $entry);
             }
-            if (empty($job['outer_products'])) {
+            if (!isset($job['outer_folder'])) {
                 @unlink($directory . '/workbook.xlsx');
                 if (!$this->summary($job)['ready']) {
                     @unlink($archive);

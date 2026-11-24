@@ -6,6 +6,7 @@
 
     var submit = form.querySelector('button[type="submit"]');
     var status = document.getElementById('nothiz-upload-status');
+    var ignoreOuterFolder = document.getElementById('nothiz-ignore-outer-folder');
     var running = false;
     var resume = document.getElementById('nothiz-resume-scan');
     var pending = form.dataset.pendingScan;
@@ -20,6 +21,7 @@
         running = value;
         submit.disabled = value;
         resume.disabled = value;
+        ignoreOuterFolder.disabled = value;
         if (run) run.disabled = value;
         inputs.forEach(function (input) { input.disabled = value; });
         if (value) window.addEventListener('beforeunload', warnBeforeLeaving);
@@ -74,7 +76,7 @@
             try {
                 await scan(new URLSearchParams({
                     job: wrapper.dataset.job,
-                    strip_products: wrapper.dataset.strip
+                    ignore_outer_folder: wrapper.dataset.strip
                 }), output);
                 window.removeEventListener('beforeunload', warnBeforeLeaving);
                 window.location.assign(form.action);
@@ -200,6 +202,7 @@
         if (images) {
             meta.set('images_name', images.name);
             meta.set('images_size', images.size);
+            if (ignoreOuterFolder.checked) meta.set('ignore_outer_folder', '1');
         }
 
         setRunning(true);

@@ -21,6 +21,7 @@ function check($value, $message) {
 
 define('DIR_UPLOAD', sys_get_temp_dir() . '/nothiz-controller-' . bin2hex(random_bytes(6)) . '/');
 mkdir(DIR_UPLOAD);
+define('DIR_IMAGE', DIR_UPLOAD);
 define('DIR_SYSTEM', dirname(__DIR__) . '/upload/system/');
 require dirname(__DIR__) . '/upload/admin/controller/extension/module/nothiz_product_import.php';
 
@@ -116,12 +117,42 @@ try {
     $controller->batch();
     $result = json_decode($response->output, true);
     check($result['paused'] && $result['processed'] === 1 && $model->calls === ['FIRST'], 'A pause requested during a row should finish that row only');
+    $request->post = [
+        'workbook_name' => 'fixture.xlsx',
+        'workbook_size' => '1',
+        'images_name' => 'fixture.zip',
+        'images_size' => '1',
+        'ignore_outer_folder' => '1',
+    ];
+    $controller->beginUpload();
+    $upload = json_decode($response->output, true)['upload'];
+    $stagingDir = DIR_UPLOAD . 'nothiz_product_import_' . $upload;
+    $session->data['nothiz_product_import_upload']['needs_images'] = true;
+    $session->data['nothiz_product_import_upload']['archive_sha'] = str_repeat('a', 64);
+    file_put_contents($stagingDir . '/reused-images.json', '{}');
+    file_put_contents($stagingDir . '/archive-scan.json', '{"strip":true,"state":null,"done":true}');
+    $zip = new ZipArchive();
+    check($zip->open($stagingDir . '/images.zip', ZipArchive::CREATE) === true, 'Create ZIP fixture');
+    $png = imagecreatetruecolor(4, 4);
+    ob_start();
+    imagepng($png);
+    $zip->addFromString('Photos 2026/Home/NEW/a.png', ob_get_clean());
+    $zip->close();
+
+    $request->post = ['upload' => $upload];
+    $controller->checkArchive();
+    $result = json_decode($response->output, true);
+    $scan = json_decode(file_get_contents($stagingDir . '/archive-scan.json'), true);
+    check(!empty($result['done']) && ($scan['index']['outer_folder'] ?? null) === 'Photos 2026', 'Restart obsolete scan checkpoints and detect the upload folder');
+    check(($scan['index']['groups']['NEW']['categories'] ?? null) === ['Home'], 'Use the upload preference even on a separate scan request');
+
     echo "Controller checks passed\n";
 } finally {
-    foreach (array_diff(scandir($dir), ['.', '..']) as $name) {
-        $path = $dir . '/' . $name;
-        unlink($path);
+    foreach (array_filter([$dir, $stagingDir ?? null]) as $directory) {
+        foreach (array_diff(scandir($directory), ['.', '..']) as $name) {
+            unlink($directory . '/' . $name);
+        }
+        rmdir($directory);
     }
-    rmdir($dir);
     rmdir(DIR_UPLOAD);
 }

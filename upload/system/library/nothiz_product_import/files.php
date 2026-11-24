@@ -297,7 +297,7 @@ class NothizProductImportFiles {
 
     // Image archive inspection
 
-    public static function scanImages(string $path, ?array $state, string $imageRoot, bool $stripProducts, int $limit = 80): array {
+    public static function scanImages(string $path, ?array $state, string $imageRoot, bool $ignoreOuterFolder, int $limit = 80): array {
         $zip = self::openArchive($path, self::IMAGE_ARCHIVE_BYTES, false);
         try {
             $count = $zip->numFiles;
@@ -305,8 +305,8 @@ class NothizProductImportFiles {
             $state = $state ?? [
                 'processed' => 0,
                 'bytes' => 0,
-                'products' => false,
-                'other' => false,
+                'outer_folder' => null,
+                'has_wrapped_layout' => false,
                 'catalog_products' => false,
                 'other_catalog' => false,
                 'deep' => false,
@@ -332,15 +332,27 @@ class NothizProductImportFiles {
                     if ($state['bytes'] > self::EXPANDED_IMAGE_ARCHIVE_BYTES) {
                         throw new NothizProductImportIssue('archive_expanded', ['path' => $path], 'The image ZIP exceeds the maximum expanded size.');
                     }
-                    if (!$directory && !self::imageJunk($parts) && self::isImageName($path) && count($parts) >= 3 && count($parts) <= 6) {
-                        $products = $parts[0] === 'products' && count($parts) >= 4 && count($parts) <= 5;
-                        $catalogProducts = array_slice($parts, 0, 2) === ['catalog', 'products'] && count($parts) >= 5;
-                        $state[$products ? 'products' : 'other'] = true;
-                        $state[$catalogProducts ? 'catalog_products' : 'other_catalog'] = true;
-                        $state['deep'] = $state['deep'] || count($parts) > 4;
+                    if (!$directory && !self::imageJunk($parts) && self::isImageName($path)) {
+                        $depth = count($parts);
+                        $folder = $depth > 1 ? $parts[0] : false;
+                        if ($state['outer_folder'] === null) {
+                            $state['outer_folder'] = $folder;
+                        } elseif ($state['outer_folder'] !== $folder) {
+                            $state['outer_folder'] = false;
+                        }
+                        $state['has_wrapped_layout'] = $state['has_wrapped_layout'] || ($depth >= 4 && $depth <= 5);
+
+                        if ($depth >= 3 && $depth <= 6) {
+                            $catalogProducts = array_slice($parts, 0, 2) === ['catalog', 'products'] && $depth >= 5;
+                            $state[$catalogProducts ? 'catalog_products' : 'other_catalog'] = true;
+                            $state['deep'] = $state['deep'] || $depth > 4;
+                        }
+                    }
+                    if ($position === $count - 1 && !$state['has_wrapped_layout']) {
+                        $state['outer_folder'] = null;
                     }
                 } elseif (!$directory) {
-                    self::scanImage($zip, $index, $stat, $parts, $root, $stripProducts, $state);
+                    self::scanImage($zip, $index, $stat, $parts, $root, $ignoreOuterFolder, $state);
                 }
             } while ($state['processed'] < $end && microtime(true) < $deadline);
 
@@ -354,7 +366,7 @@ class NothizProductImportFiles {
                     'groups' => $state['groups'],
                     'issues' => $state['issues'],
                     'warnings' => $state['warnings'],
-                    'outer_products' => $state['products'] && !$state['other'],
+                    'outer_folder' => is_string($state['outer_folder']) ? $state['outer_folder'] : null,
                 ],
             ];
         } finally {
@@ -372,16 +384,16 @@ class NothizProductImportFiles {
         return $result['index']['groups'];
     }
 
-    private static function scanImage(ZipArchive $zip, int $index, array $stat, array $parts, string $root, bool $stripProducts, array &$state): void {
+    private static function scanImage(ZipArchive $zip, int $index, array $stat, array $parts, string $root, bool $ignoreOuterFolder, array &$state): void {
         $path = $stat['name'];
         if (self::imageJunk($parts) || !self::isImageName($path)) {
             $state['warnings'][] = ['code' => 'image_ignored', 'params' => ['path' => $path]];
             return;
         }
-        if ($state['catalog_products'] && !$state['other_catalog'] && $state['deep'] && array_slice($parts, 0, 2) === ['catalog', 'products']) {
-            $parts = array_slice($parts, 2);
-        } elseif ($stripProducts && $state['products'] && !$state['other'] && $parts[0] === 'products') {
+        if ($ignoreOuterFolder && $state['outer_folder'] === $parts[0]) {
             $parts = array_slice($parts, 1);
+        } elseif ($state['catalog_products'] && !$state['other_catalog'] && $state['deep'] && array_slice($parts, 0, 2) === ['catalog', 'products']) {
+            $parts = array_slice($parts, 2);
         }
         array_pop($parts);
         $sku = array_pop($parts);

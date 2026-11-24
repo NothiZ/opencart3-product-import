@@ -64,6 +64,13 @@
               <code>{{ text.text_path_subcategory|e }}</code>
             </div>
             <p id="nothiz-zip-optional">{{ text.text_skip_existing|e }} {{ text.text_zip_optional|e }}</p>
+            <div class="checkbox">
+              <label for="nothiz-ignore-outer-folder">
+                <input type="checkbox" id="nothiz-ignore-outer-folder" aria-describedby="nothiz-outer-folder-help"{% if upload_ignore_outer_folder %} checked{% endif %}>
+                {{ text.entry_ignore_outer_folder|e }}
+              </label>
+            </div>
+            <p id="nothiz-outer-folder-help">{{ text.text_ignore_outer_folder_help|e }}</p>
           </div>
           <div class="npi-actions">
             <button type="submit" class="npi-button npi-button--primary">
@@ -122,16 +129,20 @@
               {{ image_source == 'cache' ? text.text_archive_reused|e : text.text_catalog_reused|e }}
             </p>
           {% endif %}
-          {% if outer_products %}
+          {% if outer_folder is not null %}
             <div class="npi-instructions">
-              <p>{{ (strip_products ? text.text_products_excluded : text.text_outer_products)|e }}</p>
+              <p>{{ (ignore_outer_folder ? text.text_outer_folder_excluded : text.text_outer_folder_detected)|format(outer_folder)|e }}</p>
               {% if can_modify and phase == 2 and not pending_scan %}
                 <button id="nothiz-wrapper" type="button" class="npi-button npi-button--secondary"
-                  data-job="{{ job_id|e('html_attr') }}" data-strip="{{ strip_products ? '0' : '1' }}">
-                  {{ (strip_products ? text.button_keep_products : text.button_strip_products)|e }}
+                  data-job="{{ job_id|e('html_attr') }}" data-strip="{{ ignore_outer_folder ? '0' : '1' }}">
+                  {{ (ignore_outer_folder ? text.button_default_categories : text.button_ignore_outer_folder)|e }}
                 </button>
                 <p id="nothiz-wrapper-status" class="npi-live-message" role="status"></p>
               {% endif %}
+            </div>
+          {% elseif ignore_outer_folder %}
+            <div class="npi-banner npi-banner--warning">
+              <i class="fa fa-exclamation-circle" aria-hidden="true"></i><p>{{ text.text_outer_folder_unavailable|e }}</p>
             </div>
           {% endif %}
           {% if warnings %}
@@ -249,6 +260,6 @@
   </div>
 </div>
 <script src="view/javascript/nothiz/sha256.min.js?v=0.11.1"></script>
-<script src="view/javascript/nothiz_product_import_upload.js?v=5"></script>
+<script src="view/javascript/nothiz_product_import_upload.js?v=6"></script>
 <script src="view/javascript/nothiz_product_import_ui.js?v=5"></script>
 {{ footer }}

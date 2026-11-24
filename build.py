@@ -10,6 +10,7 @@ paths = sorted(path for path in (root / "upload").rglob("*") if path.is_file())
 if not paths:
     raise SystemExit("The OpenCart upload folder is empty.")
 with ZipFile(output, "w", ZIP_DEFLATED) as archive:
+    archive.write(root / "LICENSE", "LICENSE")
     for path in paths:
         archive.write(path, path.relative_to(root).as_posix())
 with ZipFile(output) as archive:

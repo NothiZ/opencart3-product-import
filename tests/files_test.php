@@ -154,6 +154,33 @@ try {
     }, 'Missing archive member was accepted while publishing');
     check(!is_file($imageRoot . '/' . str_replace('/7/', '/8/', $paths[0])), 'Partial publish left an image');
 
+    $wrapperName = 'Photos Summer 2026';
+    $wrapped = $wrapperName . '/Coffee/Scales/WRAPPER/a.png';
+    writeArchive($archive, [
+        $wrapped => $png,
+        $wrapperName . '/Home/SIMPLE/a.png' => $png,
+        $wrapperName . '/MISPLACED/a.png' => $png,
+        'notes/readme.txt' => 'unrelated',
+    ]);
+    $stripped = NothizProductImportFiles::scanImages($archive, null, $imageRoot, true)['index'];
+    check(($stripped['outer_folder'] ?? null) === $wrapperName, 'Any shared outer folder should be eligible');
+    check($stripped['groups']['WRAPPER']['categories'] === ['Coffee', 'Scales'], 'Only the outer folder should be removed from categories');
+    check($stripped['groups']['SIMPLE']['categories'] === ['Home'], 'One-level categories should use the folder below the wrapper');
+    check($stripped['groups']['WRAPPER']['entries'] === [$wrapped], 'ZIP image paths must retain the outer folder');
+    check($stripped['issues']['MISPLACED'][0]['code'] === 'image_layout', 'Misplaced images should not hide the wrapper');
+
+    $kept = NothizProductImportFiles::scanImages($archive, null, $imageRoot, false)['index'];
+    check($kept['groups']['SIMPLE']['categories'] === [$wrapperName, 'Home'], 'Keeping the outer folder should retain the default classification');
+
+    writeArchive($archive, [
+        $wrapperName . '/Home/SIMPLE/a.png' => $png,
+        'Other/Books/OTHER/a.png' => $png,
+    ]);
+    $mixed = NothizProductImportFiles::scanImages($archive, null, $imageRoot, true)['index'];
+    check(($mixed['outer_folder'] ?? null) === null, 'Multiple roots cannot share a wrapper');
+    check($mixed['groups']['SIMPLE']['categories'] === [$wrapperName, 'Home']
+        && $mixed['groups']['OTHER']['categories'] === ['Other', 'Books'], 'Multiple roots should use default categories even when requested');
+
     $red = 'The scanner must support resumable preview';
     check(method_exists(NothizProductImportFiles::class, 'scanImages'), $red);
     $natural = ['products/Home/NAT/item1.PNG', 'products/Home/NAT/item2.png', 'products/Home/NAT/item10.png'];
@@ -165,6 +192,7 @@ try {
         'Outside/MISFIT/invalid.gif' => 'unsupported image',
         'products/Home/NAT/spare.gif' => 'unsupported image next to valid images',
         'products/Home/BAD/fake.png' => 'text',
+        'products/MISPLACED/a.png' => $png,
         'products/Home/AMB/a.png' => $png,
         'products/Other/AMB/b.png' => $png,
         'products/Home/CASE/A.png' => $png,
@@ -181,9 +209,10 @@ try {
     }
     $index = $scan['index'];
     check($scan['total'] === $scan['processed'] && $scan['state'] === null, 'Scan did not complete');
-    check($index['outer_products'] && $index['groups']['NAT'] === ['categories' => ['Home'], 'entries' => $natural], 'Products wrapper or natural filename order was incorrect');
+    check($index['outer_folder'] === 'products' && $index['groups']['NAT'] === ['categories' => ['Home'], 'entries' => $natural], 'Products wrapper or natural filename order was incorrect');
     check($index['groups']['TRUNC']['entries'] === [$broken], 'Preview attempted to decode image data');
     check($index['issues']['BAD'][0]['code'] === 'image_type', 'Corrupt header must fail only its matching SKU');
+    check($index['issues']['MISPLACED'][0]['code'] === 'image_layout', 'A misplaced image inside products/ must fail only its own SKU');
     check($index['issues']['AMB'][0]['code'] === 'image_folders', 'Ambiguous folders must fail only their matching SKU');
     check($index['issues']['CASE'][0]['code'] === 'image_duplicate', 'Case-colliding paths must fail only their matching SKU');
     check($index['warnings'][0] === ['code' => 'image_ignored', 'params' => ['path' => 'products/Home/NAT/README.txt']], 'Ignored entry warning did not identify ZIP path');
