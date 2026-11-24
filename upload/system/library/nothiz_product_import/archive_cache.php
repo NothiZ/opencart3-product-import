@@ -1,11 +1,13 @@
 <?php
 
+require_once __DIR__ . '/private_storage.php';
+
 class NothizProductImportArchiveCache {
     public const TTL = 72 * 60 * 60;
     public const MAX_ARCHIVES = 3;
     public const MAX_BYTES = 1024 * 1024 * 1024;
 
-    private const INDEX_VERSION = 1;
+    private const INDEX_VERSION = 2;
     private const INDEX_BYTES = 24 * 1024 * 1024;
     private const DIGEST = '/\A[0-9a-f]{64}\z/';
     private $root;
@@ -18,7 +20,7 @@ class NothizProductImportArchiveCache {
     }
 
     /**
-     * The caller holds the destination job lock. A legacy hit has no reusable image index.
+     * The caller holds the destination job lock. An unusable index can be rebuilt from a verified ZIP.
      *
      * @return array{index:array|null}|null
      */
@@ -35,11 +37,13 @@ class NothizProductImportArchiveCache {
                 $entry = $this->directory . '/' . $sha;
                 $cachedBytes = self::size($entry . '.zip');
                 if ($cachedBytes === $bytes) {
-                    $index = $this->readIndex($entry . '.json', $sha, $bytes);
-                    if ($index === null || @hash_file('sha256', $entry . '.zip') !== $sha) {
+                    if (@hash_file('sha256', $entry . '.zip') !== $sha) {
                         $this->remove($entry);
                     } elseif ($this->attach($entry . '.zip', $destination, $bytes)) {
-                        @touch($entry . '.json');
+                        $index = $this->readIndex($entry . '.json', $sha, $bytes);
+                        if (self::size($entry . '.json') > 0) {
+                            @touch($entry . '.json');
+                        }
                         return ['index' => $index];
                     }
                 }
@@ -49,7 +53,8 @@ class NothizProductImportArchiveCache {
         }
 
         if ($legacyPath !== null && $this->isJobArchive($legacyPath) && self::size($legacyPath) === $bytes
-            && @hash_file('sha256', $legacyPath) === $sha && $this->attach($legacyPath, $destination, $bytes)) {
+            && @hash_file('sha256', $legacyPath) === $sha && NothizProductImportPrivateStorage::protect(dirname($legacyPath))
+            && $this->attach($legacyPath, $destination, $bytes)) {
             return ['index' => null];
         }
         return null;
@@ -81,19 +86,20 @@ class NothizProductImportArchiveCache {
         try {
             $this->prune();
             $entry = $this->directory . '/' . $sha;
-            if (!self::isVacant($entry . '.json') || !$this->attach($source, $entry . '.zip', $bytes)) {
+            $existingArchive = self::size($entry . '.zip') === $bytes && @hash_file('sha256', $entry . '.zip') === $sha;
+            if ($existingArchive && $this->readIndex($entry . '.json', $sha, $bytes) !== null) {
                 return;
             }
-
-            $manifest = @fopen($entry . '.json', 'xb');
-            if ($manifest === false) {
-                @unlink($entry . '.zip');
-                return;
-            }
-            $written = @fwrite($manifest, $metadata);
-            $closed = @fclose($manifest);
-            if ($written !== strlen($metadata) || !$closed) {
+            if (!$existingArchive) {
                 $this->remove($entry);
+                if (!$this->attach($source, $entry . '.zip', $bytes)) {
+                    return;
+                }
+            }
+            if (!$this->writeIndex($entry . '.json', $metadata)) {
+                if (!$existingArchive) {
+                    @unlink($entry . '.zip');
+                }
                 return;
             }
             $this->prune($entry);
@@ -132,6 +138,10 @@ class NothizProductImportArchiveCache {
             }
             usleep(50000);
         }
+        if (!NothizProductImportPrivateStorage::protect($this->directory)) {
+            fclose($lock);
+            return false;
+        }
         return $lock;
     }
 
@@ -140,8 +150,8 @@ class NothizProductImportArchiveCache {
         foreach (@scandir($this->directory) ?: [] as $name) {
             if (preg_match('/\A([0-9a-f]{64})\.(?:zip|json)\z/', $name, $entry)) {
                 $prefixes[$this->directory . '/' . $entry[1]] = true;
-            } elseif (preg_match('/\A[0-9a-f]{64}\.zip\.cache-tmp\z/', $name)) {
-                // A cache copy may have stopped before its atomic rename.
+            } elseif (preg_match('/\A[0-9a-f]{64}\.(?:zip|json)\.cache-tmp\z/', $name)) {
+                // A cache write may have stopped before its atomic rename.
                 @unlink($this->directory . '/' . $name);
             }
         }
@@ -150,8 +160,8 @@ class NothizProductImportArchiveCache {
         $cutoff = time() - self::TTL;
         foreach ($prefixes as $entry => $unused) {
             $bytes = self::size($entry . '.zip');
-            $indexBytes = self::size($entry . '.json');
-            $mtime = $indexBytes > 0 && $indexBytes <= self::INDEX_BYTES ? @filemtime($entry . '.json') : false;
+            // A missing index still leaves ZIP bytes eligible for reuse until expiry.
+            $mtime = self::size($entry . '.json') > 0 ? @filemtime($entry . '.json') : @filemtime($entry . '.zip');
             if ($bytes <= 0 || $bytes > self::MAX_BYTES || $mtime === false || $mtime <= $cutoff) {
                 $this->remove($entry);
                 continue;
@@ -177,6 +187,21 @@ class NothizProductImportArchiveCache {
     private function remove(string $entry): void {
         @unlink($entry . '.json');
         @unlink($entry . '.zip');
+    }
+
+    private function writeIndex(string $path, string $metadata): bool {
+        $temporary = $path . '.cache-tmp';
+        $manifest = @fopen($temporary, 'xb');
+        if ($manifest === false) {
+            return false;
+        }
+        $written = @fwrite($manifest, $metadata);
+        $closed = @fclose($manifest);
+        if ($written === strlen($metadata) && $closed && @rename($temporary, $path)) {
+            return true;
+        }
+        @unlink($temporary);
+        return false;
     }
 
     private function readIndex(string $path, string $sha, int $bytes): ?array {

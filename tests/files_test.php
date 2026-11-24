@@ -13,10 +13,13 @@ function check($condition, string $message): void {
     }
 }
 
-function rejects(callable $read, string $message): void {
+function rejects(callable $read, string $message, ?array $issue = null): void {
     try {
         $read();
     } catch (RuntimeException $error) {
+        if ($issue !== null) {
+            check($error instanceof NothizProductImportIssue && $error->issue() === $issue, $message);
+        }
         return;
     }
     throw new RuntimeException($message);
@@ -151,18 +154,150 @@ try {
     }, 'Missing archive member was accepted while publishing');
     check(!is_file($imageRoot . '/' . str_replace('/7/', '/8/', $paths[0])), 'Partial publish left an image');
 
-    foreach ([
-        'catalog/products/Other/0007/a.png' => $png,
-        '../other.png' => $png,
-        'catalog/products/Home/BAD/fake.png' => 'text',
-        'catalog/products/Home/BAD/truncated.png' => substr($png, 0, 25),
-        'catalog/products/Home/BAD/script.php' => '<?php echo 1;',
-    ] as $name => $content) {
-        writeArchive($archive, $members + [$name => $content]);
-        rejects(function () use ($archive) {
-            NothizProductImportFiles::inspectImages($archive);
-        }, 'Invalid ZIP member accepted: ' . $name);
+    $red = 'The scanner must support resumable preview';
+    check(method_exists(NothizProductImportFiles::class, 'scanImages'), $red);
+    $natural = ['products/Home/NAT/item1.PNG', 'products/Home/NAT/item2.png', 'products/Home/NAT/item10.png'];
+    $broken = 'products/Home/TRUNC/header.png';
+    $brokenPng = substr($png, 0, 33);
+    check(getimagesizefromstring($brokenPng) !== false && @imagecreatefromstring($brokenPng) === false, 'Bad fixture must still have a recognizable header');
+    $reviewMembers = array_fill_keys(array_reverse($natural), $png) + [
+        'products/Home/NAT/README.txt' => 'unrelated',
+        'Outside/MISFIT/invalid.gif' => 'unsupported image',
+        'products/Home/NAT/spare.gif' => 'unsupported image next to valid images',
+        'products/Home/BAD/fake.png' => 'text',
+        'products/Home/AMB/a.png' => $png,
+        'products/Other/AMB/b.png' => $png,
+        'products/Home/CASE/A.png' => $png,
+        'products/Home/CASE/a.png' => $png,
+        $broken => $brokenPng,
+    ];
+    writeArchive($archive, $reviewMembers);
+    $scan = NothizProductImportFiles::scanImages($archive, null, $imageRoot, true, 2);
+    check(!$scan['done'] && $scan['processed'] === 2 && $scan['index'] === null, 'Initial scan exceeded the checkpoint');
+    while (!$scan['done']) {
+        $previous = $scan['processed'];
+        $scan = NothizProductImportFiles::scanImages($archive, json_decode(json_encode($scan['state']), true), $imageRoot, true, 2);
+        check($scan['processed'] > $previous && $scan['processed'] <= $previous + 2, 'Resumed scan exceeded the checkpoint');
     }
+    $index = $scan['index'];
+    check($scan['total'] === $scan['processed'] && $scan['state'] === null, 'Scan did not complete');
+    check($index['outer_products'] && $index['groups']['NAT'] === ['categories' => ['Home'], 'entries' => $natural], 'Products wrapper or natural filename order was incorrect');
+    check($index['groups']['TRUNC']['entries'] === [$broken], 'Preview attempted to decode image data');
+    check($index['issues']['BAD'][0]['code'] === 'image_type', 'Corrupt header must fail only its matching SKU');
+    check($index['issues']['AMB'][0]['code'] === 'image_folders', 'Ambiguous folders must fail only their matching SKU');
+    check($index['issues']['CASE'][0]['code'] === 'image_duplicate', 'Case-colliding paths must fail only their matching SKU');
+    check($index['warnings'][0] === ['code' => 'image_ignored', 'params' => ['path' => 'products/Home/NAT/README.txt']], 'Ignored entry warning did not identify ZIP path');
+    check(array_column($index['warnings'], 'params') === [
+        ['path' => 'products/Home/NAT/README.txt'],
+        ['path' => 'Outside/MISFIT/invalid.gif'],
+        ['path' => 'products/Home/NAT/spare.gif'],
+    ], 'Unsupported images should warn and leave valid JPEG or PNG matches intact');
+    $literal = NothizProductImportFiles::scanImages($archive, null, $imageRoot, false)['index'];
+    check($literal['groups']['NAT']['categories'] === ['products', 'Home'], 'The preview option should only change category interpretation');
+
+    $prefix = NothizProductImportFiles::IMPORT_IMAGE_PATH . '/';
+    $oldFile = $imageRoot . '/' . $prefix . $natural[0];
+    mkdir(dirname($oldFile), 0755, true);
+    file_put_contents($oldFile, $png);
+    $scan = NothizProductImportFiles::scanImages($archive, null, $imageRoot, true)['index'];
+    check(($scan['groups']['NAT']['reused'] ?? 0) === 1, 'Preview did not report proven identical images');
+    $publication = [];
+    $paths = NothizProductImportFiles::publishImages($archive, $natural, $imageRoot, $job, 7, $publication);
+    check($paths === array_map(function ($path) use ($prefix) { return $prefix . $path; }, $natural), 'Published original paths, names or casing changed');
+    check(array_column($publication, 'path') === array_slice($paths, 1), 'Reused image was captured as newly published');
+    NothizProductImportFiles::discardPublishedImages($publication, $imageRoot);
+    check(is_file($oldFile) && !is_file($imageRoot . '/' . $paths[1]), 'Rollback must remove only newly published files');
+
+    $differentSameSize = $png;
+    $differentSameSize[45] = chr(ord($png[45]) ^ 1);
+    file_put_contents($oldFile, $differentSameSize);
+    $scan = NothizProductImportFiles::scanImages($archive, null, $imageRoot, true)['index'];
+    check($scan['issues']['NAT'][0] === ['code' => 'image_conflict', 'params' => ['path' => $natural[0]]], 'Preflight must detect a same-size different image');
+    rejects(function () use ($archive, $natural, $imageRoot, $job, &$publication) {
+        NothizProductImportFiles::publishImages($archive, [$natural[1], $natural[0]], $imageRoot, $job, 7, $publication);
+    }, 'Publishing accepted nonidentical destination bytes');
+    check(file_get_contents($oldFile) === $differentSameSize && !is_file($imageRoot . '/' . $paths[1]), 'Conflict overwrote an image or failed to roll back its row');
+
+    $corruptFile = $imageRoot . '/' . $prefix . $broken;
+    mkdir(dirname($corruptFile), 0755, true);
+    file_put_contents($corruptFile, $brokenPng);
+    $scan = NothizProductImportFiles::scanImages($archive, null, $imageRoot, true)['index'];
+    check(!isset($scan['issues']['TRUNC']), 'Preflight should compare equal bytes without GD');
+    rejects(function () use ($archive, $broken, $imageRoot, $job, &$publication) {
+        NothizProductImportFiles::publishImages($archive, [$broken], $imageRoot, $job, 7, $publication);
+    }, 'Publishing reused corrupt image without decoding');
+    check(file_get_contents($corruptFile) === $brokenPng, 'The pre-existing corrupt image was removed');
+
+    $exactPath = 'Home/DUP/first.png';
+    $otherPath = 'Home/DUP/other.png';
+    $upperCase = 'Home/XCASE/file.png';
+    $lowerCase = 'home/xcase/file.png';
+    writeArchive($archive, [$exactPath => $png, $otherPath => $png, $upperCase => $png, $lowerCase => $png, 'Home/SAFE/ok.png' => $png]);
+    $archiveBytes = file_get_contents($archive);
+    file_put_contents($archive, str_replace($otherPath, $exactPath, $archiveBytes));
+    $scan = NothizProductImportFiles::scanImages($archive, null, $imageRoot, false)['index'];
+    check($scan['groups']['SAFE']['entries'] === ['Home/SAFE/ok.png'] && $scan['issues']['DUP'][0]['code'] === 'image_duplicate', 'An exact duplicate ZIP member must only fail its SKU');
+    check(!isset($scan['groups']['XCASE']) && !isset($scan['groups']['xcase']) && isset($scan['issues']['XCASE'], $scan['issues']['xcase']), 'A case-folded destination collision must invalidate both spellings');
+
+    $oversizedPath = 'Home/LONG/' . str_repeat('a', 230) . '.png';
+    $multipleExtensions = 'Home/SUFFIX/picture.php.png';
+    $unicodePath = 'Home/UNICODE/Blue chair Ω.png';
+    writeArchive($archive, [$oversizedPath => $png, $multipleExtensions => $png, $unicodePath => $png]);
+    $scan = NothizProductImportFiles::scanImages($archive, null, $imageRoot, false)['index'];
+    check(($scan['issues']['LONG'][0]['code'] ?? '') === 'image_path_length', 'Preview accepted a path longer than the OpenCart image column');
+    check(($scan['issues']['SUFFIX'][0]['code'] ?? '') === 'image_extension_unsafe', 'Preview accepted an executable secondary filename extension');
+    $path = NothizProductImportFiles::publishImages($archive, [$unicodePath], $imageRoot, $job, 7, $publication);
+    check($path === [$prefix . $unicodePath] && file_get_contents($imageRoot . '/' . $path[0]) === $png, 'Unicode and spaces in original filename changed');
+    foreach ([$oversizedPath, $multipleExtensions] as $invalid) {
+        rejects(function () use ($archive, $invalid, $imageRoot, $job, &$publication) {
+            NothizProductImportFiles::publishImages($archive, [$invalid], $imageRoot, $job, 7, $publication);
+        }, 'Publication accepted an unusable original filename');
+    }
+
+    writeArchive($archive, $reviewMembers);
+    $zip = new ZipArchive();
+    check($zip->open($archive) === true, 'Could not update link fixture');
+    $zip->addFromString('Home/SYMLINK/link.png', 'link-target');
+    $zip->setExternalAttributesName('Home/SYMLINK/link.png', ZipArchive::OPSYS_UNIX, 0120777 << 16);
+    $zip->close();
+    rejects(function () use ($archive, $imageRoot) {
+        NothizProductImportFiles::scanImages($archive, null, $imageRoot, true);
+    }, 'Archived symlink escaped archive-wide validation');
+
+    $linked = $imageRoot . '/' . $prefix . 'Home/LINK/picture.png';
+    mkdir(dirname($linked), 0755, true);
+    if (@symlink($corruptFile, $linked)) {
+        writeArchive($archive, ['Home/LINK/picture.png' => $brokenPng]);
+        $scan = NothizProductImportFiles::scanImages($archive, null, $imageRoot, false)['index'];
+        check($scan['issues']['LINK'][0]['code'] === 'image_conflict' && is_link($linked), 'Preflight followed a destination symlink');
+        unlink($linked);
+    }
+
+    $longArchivePath = str_repeat(str_repeat('a', 210) . '/', 5) . 'a.png';
+    foreach ([
+        '../other.png' => 'archive_path',
+        'Home/NUL.txt/image.png' => 'archive_path',
+        'Home/COM²/image.png' => 'archive_path',
+        'Home/CONOUT$/image.png' => 'archive_path',
+        'Home/ MATCH/image.png' => 'archive_path',
+        'Home/MATCH/image.png ' => 'archive_path',
+        'Home/MATCH/question?.png' => 'archive_path',
+        $longArchivePath => 'archive_path_length',
+    ] as $unsafe => $code) {
+        writeArchive($archive, $reviewMembers + [$unsafe => $png]);
+        $displayed = strlen($unsafe) > 1024 ? substr($unsafe, 0, 1024) . '…' : $unsafe;
+        rejects(function () use ($archive, $imageRoot) {
+            NothizProductImportFiles::scanImages($archive, null, $imageRoot, true);
+        }, 'Incorrect diagnostic for unsafe ZIP path: ' . $unsafe, ['code' => $code, 'params' => ['path' => $displayed]]);
+        rejects(function () use ($archive, $unsafe, $imageRoot, $job, &$publication) {
+            NothizProductImportFiles::publishImages($archive, [$unsafe], $imageRoot, $job, 7, $publication);
+        }, 'Unsafe file was not rejected before publishing: ' . $unsafe, ['code' => $code, 'params' => ['path' => $displayed]]);
+    }
+    $large = str_repeat('A', 15 * 1024 * 1024 + 1);
+    writeArchive($archive, ['Home/SAFE/ok.png' => $png, 'Home/HUGE/huge.png' => $large, 'ignored.txt' => $large]);
+    $scan = NothizProductImportFiles::scanImages($archive, null, $imageRoot, false)['index'];
+    check(($scan['issues']['HUGE'][0]['code'] ?? '') === 'archive_entry_size', 'Expanded member limit must identify the oversized image');
+    check($scan['groups']['SAFE']['entries'] === ['Home/SAFE/ok.png'] && $scan['warnings'][0]['params']['path'] === 'ignored.txt', 'Oversized member must not invalidate other image matches');
 } finally {
     removeFixture($root);
 }

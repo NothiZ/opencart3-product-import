@@ -8,7 +8,8 @@ class Controller {
 
 class TestResponse {
     public $output;
-    public function addHeader($header) {}
+    public $headers = [];
+    public function addHeader($header) { $this->headers[] = $header; }
     public function setOutput($output) { $this->output = $output; }
 }
 
@@ -38,10 +39,25 @@ $request = (object) ['server' => ['REQUEST_METHOD' => 'POST'], 'get' => ['user_t
 $response = new TestResponse();
 $model = new class {
     public $calls = [];
+    public $defer = true;
+    public $afterImport;
     public function importItem($item, $zipPath, $job) {
         $this->calls[] = $item['sku'];
-        return ['status' => 'created', 'message' => 'Product created'];
+        if ($this->defer) { return ['status' => 'deferred']; }
+        if ($this->afterImport) { ($this->afterImport)(); }
+        return ['status' => 'created', 'issue' => ['code' => 'created_product', 'params' => [12]]];
     }
+};
+$language = new class {
+    public $locale = 'en-gb';
+    private $messages = [];
+    public function load($route) {
+        $_ = [];
+        require dirname(__DIR__) . '/upload/admin/language/' . $this->locale . '/' . $route . '.php';
+        $this->messages = $_;
+        return $_;
+    }
+    public function get($key) { return $this->messages[$key] ?? $key; }
 };
 $controller = new ControllerExtensionModuleNothizProductImport([
     'session' => $session,
@@ -49,7 +65,7 @@ $controller = new ControllerExtensionModuleNothizProductImport([
     'response' => $response,
     'load' => new class { public function model($route) {} },
     'user' => new class { public function hasPermission($type, $route) { return true; } },
-    'language' => new class { public function load($route) {} public function get($key) { return $key; } },
+    'language' => $language,
     'log' => new class { public function write($message) { throw new RuntimeException($message); } },
     'model_extension_module_nothiz_product_import' => $model,
 ]);
@@ -58,6 +74,10 @@ try {
     $controller->batch();
     check(isset(json_decode($response->output, true)['error']), 'Bad token must be rejected');
     check(!$model->calls, 'Rejected request must not write');
+    $controller->checkArchive();
+    check(isset(json_decode($response->output, true)['error']), 'ZIP checks require a valid token');
+    $controller->pauseImport();
+    check(!is_file($dir . '/paused'), 'Rejected pause must not set a marker');
     $request->get['user_token'] = 'admin-token';
     $request->post['job'] = str_repeat('b', 32);
     $controller->batch();
@@ -65,12 +85,41 @@ try {
     $request->post['job'] = $job;
     $controller->batch();
     $result = json_decode($response->output, true);
-    check($result['done'] && $model->calls === ['NEW'], 'Only ready rows should import');
+    check(!empty($result['deferred']) && $result['processed'] === 1 && $result['ready'] === 1, 'Lock wait must preserve the ready row and save the preceding cursor');
+    $controller->pauseImport();
     $controller->batch();
-    check($model->calls === ['NEW'], 'Replayed batch must not create another product');
+    check(!empty(json_decode($response->output, true)['paused']) && $model->calls === ['NEW'], 'Pause must not advance the waiting row');
+    $model->defer = false;
+    $request->post['resume'] = '1';
+    $controller->batch();
+    $result = json_decode($response->output, true);
+    unset($request->post['resume']);
+    check($result['done'] && $model->calls === ['NEW', 'NEW'], 'Resume must import the waiting row once');
+    $controller->batch();
+    check($model->calls === ['NEW', 'NEW'], 'Replayed batch must not create another product');
+    $controller->report();
+    check(strpos($response->output, 'Created OpenCart product #12.') !== false, 'CSV should translate persisted diagnostics');
+    $language->locale = 'zh-cn';
+    $controller->report();
+    check(strpos($response->output, '已创建 OpenCart 商品 #12。') !== false, 'CSV should reflect the current backend language');
+    check(strpos($response->output, 'Created OpenCart product #12.') === false, 'Structured CSV messages should not be stuck in the earlier locale');
+
+    file_put_contents($dir . '/job.json', json_encode([
+        'items' => [
+            ['row' => 2, 'sku' => 'FIRST', 'title' => 'First', 'status' => 'ready'],
+            ['row' => 3, 'sku' => 'SECOND', 'title' => 'Second', 'status' => 'ready'],
+        ],
+        'cursor' => 0,
+    ]));
+    $model->calls = [];
+    $model->afterImport = function () use ($controller) { $controller->pauseImport(); };
+    $controller->batch();
+    $result = json_decode($response->output, true);
+    check($result['paused'] && $result['processed'] === 1 && $model->calls === ['FIRST'], 'A pause requested during a row should finish that row only');
     echo "Controller checks passed\n";
 } finally {
-    foreach (glob($dir . '/*') as $path) {
+    foreach (array_diff(scandir($dir), ['.', '..']) as $name) {
+        $path = $dir . '/' . $name;
         unlink($path);
     }
     rmdir($dir);

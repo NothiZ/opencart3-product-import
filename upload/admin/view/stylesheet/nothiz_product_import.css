@@ -95,6 +95,7 @@
 .npi-progress::-webkit-progress-value { background: var(--npi-primary); }
 .npi-progress::-moz-progress-bar { background: var(--npi-primary); }
 .npi-fill--created, .npi-fill--ready { background: #2e8b57; }
+.npi-fill--duplicate { background: #ad760f; }
 .npi-fill--skipped { background: #8193a2; }
 .npi-fill--failed { background: #bd4036; }
 .npi-dot { display: inline-block; width: 8px; height: 8px; margin-right: 2px; border-radius: 50%; }
@@ -118,6 +119,10 @@
 .npi-status { display: inline-block; white-space: nowrap; font-weight: 700; }
 .npi-status--ready, .npi-status--created { color: #1c663f; }
 .npi-status--failed { color: var(--npi-error); }
+.npi-status--duplicate { color: #8a5905; }
+.npi-table [data-npi-row-message] { white-space: pre-line; overflow-wrap: anywhere; }
+.npi-instructions summary { cursor: pointer; }
+.npi-instructions details, .npi-instructions ul { margin-top: 8px; }
 .npi-status--skipped { color: var(--npi-muted); font-weight: 600; }
 .npi-table .npi-empty { padding: 18px 9px; text-align: center; color: var(--npi-muted); }
 .npi-image-source { margin: 9px 0 0; }

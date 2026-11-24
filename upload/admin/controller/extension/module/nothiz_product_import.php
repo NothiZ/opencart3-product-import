@@ -11,7 +11,7 @@ class ControllerExtensionModuleNothizProductImport extends Controller {
     private const TEMP_FILES = [
         'workbook.xlsx', 'workbook.xlsx.ranges', 'workbook.xlsx.ranges.tmp', 'images.zip',
         'images.zip.ranges', 'images.zip.ranges.tmp', 'images.zip.cache-tmp', self::REUSE_META,
-        self::REUSE_META . '.tmp', 'job.json', 'job.tmp',
+        self::REUSE_META . '.tmp', 'job.json', 'job.json.tmp', 'job.tmp', 'archive-scan.json', 'archive-scan.json.tmp', 'paused',
     ];
     private const UPLOAD_FILES = ['workbook' => 'workbook.xlsx', 'images' => 'images.zip'];
 
@@ -21,7 +21,7 @@ class ControllerExtensionModuleNothizProductImport extends Controller {
         $text['text_excel_limit'] = sprintf($text['text_excel_limit'], NothizProductImportFiles::WORKBOOK_BYTES / 1048576);
         $text['text_zip_limit'] = sprintf($text['text_zip_limit'], NothizProductImportFiles::IMAGE_ARCHIVE_BYTES / 1048576);
         $this->document->setTitle($text['heading_title']);
-        $this->document->addStyle('view/stylesheet/nothiz_product_import.css?v=4');
+        $this->document->addStyle('view/stylesheet/nothiz_product_import.css?v=5');
         $error = '';
         $canModify = $this->authorized('modify');
 
@@ -33,6 +33,8 @@ class ControllerExtensionModuleNothizProductImport extends Controller {
                 $this->preview();
                 $this->response->redirect($this->link(self::ROUTE));
                 return;
+            } catch (NothizProductImportIssue $exception) {
+                $error = $this->issueText($exception->issue());
             } catch (RuntimeException $exception) {
                 $error = $exception->getMessage();
             } catch (Throwable $exception) {
@@ -52,7 +54,8 @@ class ControllerExtensionModuleNothizProductImport extends Controller {
         }
 
         $summary = $job === null ? [] : $this->summary($job);
-        $phase = $job === null || $error ? 1 : (!$summary['started'] ? 2 : ($summary['done'] ? 4 : 3));
+        $paused = $job !== null && !$summary['done'] && is_file($this->jobDirectory($jobId) . '/paused');
+        $phase = $job === null || $error ? 1 : ($paused || $summary['started'] ? ($summary['done'] ? 4 : 3) : 2);
         $filters = $job === null ? [] : $this->resultFilters($summary, $text);
         $activeFilter = $this->request->get['status'] ?? 'all';
         if (!is_string($activeFilter) || !isset($filters[$activeFilter])) {
@@ -65,6 +68,9 @@ class ControllerExtensionModuleNothizProductImport extends Controller {
             }));
         }
 
+        $pending = $this->session->data[self::SESSION_UPLOAD] ?? [];
+        $pendingScan = $canModify && ($pending['expires'] ?? 0) > time()
+            && is_file($this->jobDirectory($pending['id']) . '/archive-scan.json') ? $pending['id'] : '';
         $data = [
             'text' => $text,
             'error' => $error,
@@ -73,6 +79,13 @@ class ControllerExtensionModuleNothizProductImport extends Controller {
             'upload_chunk_url' => $this->link(self::ROUTE . '/uploadChunk'),
             'plan_upload_url' => $this->link(self::ROUTE . '/planUpload'),
             'batch_url' => $this->link(self::ROUTE . '/batch'),
+            'paused' => $paused,
+            'pause_url' => $this->link(self::ROUTE . '/pauseImport'),
+            'scan_url' => $this->link(self::ROUTE . '/checkArchive'),
+            'pending_scan' => $pendingScan,
+            'outer_products' => !empty($job['outer_products']),
+            'strip_products' => !empty($job['strip_products']),
+            'warnings' => array_map(function ($issue) { return $this->issueText($issue); }, $job['warnings'] ?? []),
             'report_url' => $this->link(self::ROUTE . '/report'),
             'products_url' => $this->user->hasPermission('access', 'catalog/product') ? $this->link('catalog/product') : '',
             'home_url' => $this->link('common/dashboard'),
@@ -86,7 +99,10 @@ class ControllerExtensionModuleNothizProductImport extends Controller {
             'summary' => $summary,
             'filters' => $filters,
             'active_filter' => $activeFilter,
-            'rows' => array_slice($rows, 0, 100),
+            'rows' => array_map(function ($row) {
+                $row['message'] = $this->rowMessage($row);
+                return $row;
+            }, array_slice($rows, 0, 100)),
             'more_rows' => count($rows) > 100,
             'header' => $this->load->controller('common/header'),
             'column_left' => $this->load->controller('common/column_left'),
@@ -146,6 +162,33 @@ class ControllerExtensionModuleNothizProductImport extends Controller {
         }
     }
 
+    public function pauseImport() {
+        $this->language->load(self::ROUTE);
+        if (($this->request->server['REQUEST_METHOD'] ?? '') !== 'POST' || !$this->authorized('modify')) {
+            $this->sendJson(['error' => $this->language->get('error_permission')]);
+            return;
+        }
+        try {
+            $id = $this->requestJobId();
+            $job = $this->readJob($id);
+            // Signal outside the batch lock so the running request can stop after its current row.
+            if (!$this->summary($job)['done'] && @file_put_contents($this->jobDirectory($id) . '/paused', '1') !== 1) {
+                throw new RuntimeException($this->language->get('error_storage'));
+            }
+            $this->sendJson(['requested' => true]);
+        } catch (RuntimeException $exception) {
+            $this->sendJson(['error' => $exception->getMessage()]);
+        }
+    }
+
+    private function requestJobId(): string {
+        $id = $this->request->post['job'] ?? '';
+        if (!is_string($id) || $id === '' || $id !== ($this->session->data[self::SESSION_JOB] ?? '')) {
+            throw new RuntimeException($this->language->get('error_job'));
+        }
+        return $id;
+    }
+
     public function batch() {
         $this->language->load(self::ROUTE);
         $jobId = $this->request->post['job'] ?? '';
@@ -163,43 +206,68 @@ class ControllerExtensionModuleNothizProductImport extends Controller {
             require_once DIR_SYSTEM . 'library/nothiz_product_import/files.php';
             $this->load->model(self::ROUTE);
             $directory = $this->jobDirectory($jobId);
-            $lock = is_dir($directory) ? fopen($directory . '/lock', 'c') : false;
+            $lock = $this->lockUpload($directory, true);
             if ($lock === false) {
-                throw new RuntimeException($this->language->get('error_job'));
+                $this->sendJson(['busy' => true]);
+                return;
             }
 
             try {
-                // OpenCart sessions do not guarantee that two browser requests execute serially.
-                if (!flock($lock, LOCK_EX | LOCK_NB)) {
-                    $this->sendJson(['busy' => true]);
+                $job = $this->readJob($jobId);
+                if (is_file($directory . '/archive-scan.json')) {
+                    $this->sendJson(['error' => $this->language->get('error_scan_incomplete')]);
                     return;
                 }
-
-                $job = $this->readJob($jobId);
+                $pausedPath = $directory . '/paused';
+                if (($this->request->post['resume'] ?? '') === '1' && is_file($pausedPath) && !@unlink($pausedPath)) {
+                    throw new RuntimeException($this->language->get('error_storage'));
+                }
+                $deferred = false;
+                $paused = false;
                 $from = $job['cursor'];
                 $end = min($from + 20, count($job['items']));
                 $deadline = microtime(true) + 5.0;
                 $updates = [];
                 for ($i = $from; $i < $end; ++$i) {
+                    clearstatcache(true, $pausedPath);
+                    if (is_file($pausedPath)) {
+                        $paused = true;
+                        break;
+                    }
                     $item = &$job['items'][$i];
                     if ($item['status'] === 'ready') {
-                        $job['started'] = true;
                         try {
                             $result = $this->model_extension_module_nothiz_product_import->importItem(
                                 $item, $directory . '/images.zip', substr(hash('sha256', 'images:' . $jobId), 0, 32)
                             );
-                            $item['status'] = $result['status'];
-                            $item['message'] = $result['message'];
+                            if ($result['status'] === 'deferred') {
+                                $deferred = true;
+                                unset($item);
+                                break;
+                            }
+                            foreach (['status', 'issue', 'message', 'issues'] as $field) {
+                                unset($item[$field]);
+                                if (isset($result[$field])) {
+                                    $item[$field] = $result[$field];
+                                }
+                            }
                             if (!empty($result['existing_image'])) {
                                 $item['existing_image'] = true;
                             }
+                        } catch (NothizProductImportIssue $exception) {
+                            $this->logError($exception, $item['row']);
+                            unset($item['message'], $item['issues']);
+                            $item['status'] = 'failed';
+                            $item['issue'] = $exception->issue();
                         } catch (Throwable $exception) {
                             $this->logError($exception, $item['row']);
+                            unset($item['message'], $item['issues']);
                             $item['status'] = 'failed';
-                            $item['message'] = $this->language->get('error_row');
+                            $item['issue'] = ['code' => 'unexpected_row', 'params' => []];
                         }
+                        $job['started'] = true;
                         $updates[] = [
-                            'row' => $item['row'], 'status' => $item['status'], 'message' => $item['message'],
+                            'row' => $item['row'], 'status' => $item['status'], 'message' => $this->rowMessage($item),
                         ];
                     }
                     unset($item);
@@ -214,7 +282,13 @@ class ControllerExtensionModuleNothizProductImport extends Controller {
                 if ($summary['done'] && is_file($directory . '/images.zip')) {
                     unlink($directory . '/images.zip');
                 }
-                $this->sendJson($summary + ['updated' => $updates]);
+                clearstatcache(true, $pausedPath);
+                $paused = ($paused || is_file($pausedPath)) && !$summary['done'];
+                if ($summary['done']) {
+                    @unlink($pausedPath);
+                    @unlink($directory . '/workbook.xlsx');
+                }
+                $this->sendJson($summary + ['updated' => $updates, 'paused' => $paused, 'deferred' => $deferred]);
             } finally {
                 fclose($lock);
             }
@@ -241,9 +315,12 @@ class ControllerExtensionModuleNothizProductImport extends Controller {
         $stream = fopen('php://temp', 'w+');
         fwrite($stream, "\xEF\xBB\xBF");
         $escape = PHP_VERSION_ID >= 70400 ? '' : '\\';
-        fputcsv($stream, ['Row', 'SKU', 'Title', 'Status', 'Message'], ',', '"', $escape);
+        fputcsv($stream, [$this->language->get('column_row'), 'SKU', $this->language->get('column_title'),
+            $this->language->get('column_status'), $this->language->get('column_message')], ',', '"', $escape);
         foreach ($job['items'] as $item) {
             $values = [];
+            $item['status'] = $this->language->get('status_' . $item['status']);
+            $item['message'] = $this->rowMessage($item);
             foreach (['row', 'sku', 'title', 'status', 'message'] as $key) {
                 $value = (string)$item[$key];
                 // Spreadsheet applications interpret some imported text as formulas when opening CSV.
@@ -302,7 +379,7 @@ class ControllerExtensionModuleNothizProductImport extends Controller {
 
         $this->pruneExpiredJobs();
         $directory = $this->jobDirectory($upload['id']);
-        if (!@mkdir($directory, 0700)) {
+        if (!@mkdir($directory, 0700) || !$this->protectJobDirectory($directory)) {
             $this->sendJson(['error' => $this->language->get('error_storage')]);
             return;
         }
@@ -344,6 +421,8 @@ class ControllerExtensionModuleNothizProductImport extends Controller {
                 fclose($lock);
             }
             $this->sendJson($reply);
+        } catch (NothizProductImportIssue $exception) {
+            $this->sendJson(['error' => $this->issueText($exception->issue())]);
         } catch (RuntimeException $exception) {
             $this->sendJson(['error' => $exception->getMessage()]);
         } catch (Throwable $exception) {
@@ -378,9 +457,9 @@ class ControllerExtensionModuleNothizProductImport extends Controller {
             return ['reused' => false];
         }
 
-        $metadata = json_encode($cached, JSON_UNESCAPED_UNICODE);
+        $metadata = '{}';
         $temporary = $marker . '.tmp';
-        if ($metadata === false || @file_put_contents($temporary, $metadata) !== strlen($metadata)
+        if (@file_put_contents($temporary, $metadata) !== strlen($metadata)
             || !@rename($temporary, $marker)) {
             @unlink($temporary);
             @unlink($marker);
@@ -433,13 +512,115 @@ class ControllerExtensionModuleNothizProductImport extends Controller {
         }
     }
 
+    public function checkArchive() {
+        $this->language->load(self::ROUTE);
+        if (($this->request->server['REQUEST_METHOD'] ?? '') !== 'POST' || !$this->authorized('modify')) {
+            $this->sendJson(['error' => $this->language->get('error_permission')]);
+            return;
+        }
+
+        try {
+            $this->requireImportReaders();
+            $recheck = isset($this->request->post['job']);
+            $strip = $recheck && ($this->request->post['strip_products'] ?? '') === '1';
+            if ($recheck) {
+                $jobId = $this->requestJobId();
+            } else {
+                $upload = $this->stagedUpload($this->request->post['upload'] ?? '');
+                $jobId = $upload['id'];
+            }
+            $directory = $this->jobDirectory($jobId);
+            $lock = $this->lockUpload($directory, true);
+            if ($lock === false) {
+                $this->sendJson(['busy' => true]);
+                return;
+            }
+
+            try {
+                $archive = $directory . '/images.zip';
+                if ($recheck) {
+                    $job = $this->readJob($jobId);
+                    if ($this->summary($job)['started'] || empty($job['outer_products'])
+                        || !is_file($archive) || !is_file($directory . '/workbook.xlsx')) {
+                        throw new RuntimeException($this->language->get('error_job'));
+                    }
+                } elseif (time() >= $upload['expires'] || empty($upload['needs_images'])
+                    || is_file($directory . '/job.json')) {
+                    throw new RuntimeException($this->language->get('error_upload_expired'));
+                }
+
+                $saved = $this->readScan($directory);
+                if ($saved === null || ($saved['strip'] ?? null) !== $strip) {
+                    if (!$recheck) {
+                        $this->verifyArchiveUpload($upload, $directory);
+                    }
+                    $saved = ['strip' => $strip, 'state' => null];
+                    $this->writeState($directory . '/archive-scan.json', $saved);
+                }
+
+                if (empty($saved['done'])) {
+                    $saved = NothizProductImportFiles::scanImages($archive, $saved['state'], DIR_IMAGE, $strip) + ['strip' => $strip];
+                    $this->writeState($directory . '/archive-scan.json', $saved);
+                }
+                if ($recheck && $saved['done']) {
+                    $rows = NothizProductImportFiles::readWorkbook($directory . '/workbook.xlsx');
+                    $this->applyArchiveIndex($job, $rows, $saved);
+                    $this->writeJob($directory, $job);
+                    @unlink($directory . '/archive-scan.json');
+                }
+                $this->sendJson(['done' => $saved['done'], 'processed' => $saved['processed'], 'total' => $saved['total']]);
+            } finally {
+                fclose($lock);
+            }
+        } catch (NothizProductImportIssue $exception) {
+            $this->sendJson(['error' => $this->issueText($exception->issue())]);
+        } catch (RuntimeException $exception) {
+            $this->sendJson(['error' => $exception->getMessage()]);
+        } catch (Throwable $exception) {
+            $this->logError($exception);
+            $this->sendJson(['error' => $this->language->get('error_preflight')]);
+        }
+    }
+
+    private function verifyArchiveUpload(array $upload, string $directory): void {
+        $archive = $directory . '/images.zip';
+        $reused = is_file($directory . '/' . self::REUSE_META);
+        if (!isset($upload['archive_sha']) || !is_file($archive) || (!$reused
+            && !NothizProductImportStagedUpload::complete($archive, $upload['files']['images']['bytes']))) {
+            throw new RuntimeException($this->language->get('error_upload_incomplete'));
+        }
+        if (!$reused) {
+            $actual = @hash_file('sha256', $archive);
+            if (!is_string($actual) || !hash_equals($upload['archive_sha'], $actual)) {
+                throw new RuntimeException($this->language->get('error_archive_checksum'));
+            }
+        }
+    }
+
+    private function readScan(string $directory): ?array {
+        $content = @file_get_contents($directory . '/archive-scan.json');
+        $scan = $content === false ? null : json_decode($content, true);
+        return is_array($scan) && isset($scan['strip']) && array_key_exists('state', $scan) ? $scan : null;
+    }
+
+    private function applyArchiveIndex(array &$job, array $rows, array $scan): void {
+        $index = $scan['index'];
+        $this->load->model(self::ROUTE);
+        $job['items'] = $this->model_extension_module_nothiz_product_import->preflight(
+            $rows, $index['groups'], true, $index['issues']
+        );
+        $job['cursor'] = $this->summary($job)['ready'] ? 0 : count($job['items']);
+        $job['outer_products'] = $index['outer_products'];
+        $job['strip_products'] = $scan['strip'];
+        $job['warnings'] = $index['warnings'];
+    }
+
     private function preview() {
         $this->requireImportReaders();
         $upload = $this->stagedUpload($this->request->post['staged_upload'] ?? '');
         $jobId = $upload['id'];
         $directory = $this->jobDirectory($jobId);
         $lock = $this->lockUpload($directory);
-        $consume = false;
         $saved = false;
         try {
             if (time() >= $upload['expires'] || is_file($directory . '/job.json')) {
@@ -450,71 +631,44 @@ class ControllerExtensionModuleNothizProductImport extends Controller {
             }
 
             $rows = $this->uploadedWorkbook($upload, $directory);
-            $this->load->model(self::ROUTE);
+            $job = ['cursor' => 0, 'workbook_name' => $upload['files']['workbook']['name'], 'images_name' => ''];
             $archive = $directory . '/images.zip';
-            $source = 'catalog';
             if ($upload['needs_images']) {
-                $marker = $directory . '/' . self::REUSE_META;
-                $reused = is_file($marker);
-                if (!isset($upload['archive_sha']) || !is_file($archive) || (!$reused
-                    && !NothizProductImportStagedUpload::complete($archive, $upload['files']['images']['bytes']))) {
-                    throw new RuntimeException($this->language->get('error_upload_incomplete'));
+                $scan = $this->readScan($directory);
+                if (empty($scan['done'])) {
+                    throw new RuntimeException($this->language->get('error_scan_incomplete'));
                 }
-
-                $consume = true;
-                $sha = $upload['archive_sha'];
-                if (!$reused) {
-                    $actual = @hash_file('sha256', $archive);
-                    if (!is_string($actual) || !hash_equals($sha, $actual)) {
-                        throw new RuntimeException($this->language->get('error_archive_checksum'));
-                    }
-                }
-                $metadata = $reused ? json_decode(file_get_contents($marker), true) : [];
-                $index = $metadata['index'] ?? null;
-                if (!is_array($index)) {
-                    $index = NothizProductImportFiles::inspectImages($archive);
-                    $this->archiveCache()->remember($sha, $archive, $index);
-                }
-                $items = $this->model_extension_module_nothiz_product_import->preflight($rows, $index);
-                $source = $reused ? 'cache' : 'upload';
+                $this->applyArchiveIndex($job, $rows, $scan);
+                $this->archiveCache()->remember($upload['archive_sha'], $archive, $scan['index']['groups']);
+                $job['image_source'] = is_file($directory . '/' . self::REUSE_META) ? 'cache' : 'upload';
+                $job['images_name'] = $upload['files']['images']['name'];
             } else {
-                $consume = true;
-                $items = $this->model_extension_module_nothiz_product_import->preflight($rows, [], false);
-                if (in_array('awaiting_images', array_column($items, 'status'), true)) {
+                $this->load->model(self::ROUTE);
+                $job['items'] = $this->model_extension_module_nothiz_product_import->preflight($rows, [], false);
+                if (in_array('awaiting_images', array_column($job['items'], 'status'), true)) {
                     throw new RuntimeException($this->language->get('error_catalog_changed'));
                 }
+                $job['cursor'] = count($job['items']);
+                $job['image_source'] = 'catalog';
             }
 
-            $job = [
-                'items' => $items,
-                'cursor' => 0,
-                'workbook_name' => $upload['files']['workbook']['name'],
-                'images_name' => $source === 'catalog' ? '' : $upload['files']['images']['name'],
-                'image_source' => $source,
-            ];
-            $hasReady = $this->summary($job)['ready'] > 0;
-            if (!$hasReady) {
-                $job['cursor'] = count($items);
-            }
             $this->writeJob($directory, $job);
             $saved = true;
-            foreach (['workbook.xlsx', 'workbook.xlsx.ranges', 'images.zip.ranges', self::REUSE_META] as $entry) {
-                if (is_file($directory . '/' . $entry)) {
-                    @unlink($directory . '/' . $entry);
-                }
+            foreach (['workbook.xlsx.ranges', 'images.zip.ranges', self::REUSE_META, 'archive-scan.json'] as $entry) {
+                @unlink($directory . '/' . $entry);
             }
-            if (!$hasReady && is_file($archive)) {
-                @unlink($archive);
+            if (empty($job['outer_products'])) {
+                @unlink($directory . '/workbook.xlsx');
+                if (!$this->summary($job)['ready']) {
+                    @unlink($archive);
+                }
             }
             $this->session->data[self::SESSION_JOB] = $jobId;
         } finally {
-            if ($consume) {
+            if ($saved) {
                 unset($this->session->data[self::SESSION_UPLOAD]);
             }
             fclose($lock);
-            if ($consume && !$saved) {
-                $this->deleteJob($directory);
-            }
         }
     }
 
@@ -551,12 +705,20 @@ class ControllerExtensionModuleNothizProductImport extends Controller {
         return $upload;
     }
 
-    private function lockUpload($directory) {
-        $lock = is_dir($directory) ? @fopen($directory . '/lock', 'c') : false;
+    private function lockUpload($directory, bool $nonblocking = false) {
+        $path = $directory . '/lock';
+        $lock = $this->isJobDirectory($directory) && !is_link($path) ? @fopen($path, 'c') : false;
         if ($lock === false) {
             throw new RuntimeException($this->language->get('error_storage'));
         }
-        if (!flock($lock, LOCK_EX)) {
+        if (!flock($lock, $nonblocking ? LOCK_EX | LOCK_NB : LOCK_EX)) {
+            fclose($lock);
+            if ($nonblocking) {
+                return false;
+            }
+            throw new RuntimeException($this->language->get('error_storage'));
+        }
+        if (!$this->protectJobDirectory($directory)) {
             fclose($lock);
             throw new RuntimeException($this->language->get('error_storage'));
         }
@@ -571,8 +733,10 @@ class ControllerExtensionModuleNothizProductImport extends Controller {
     }
 
     private function readJob($jobId) {
-        $file = $this->jobDirectory($jobId) . '/job.json';
-        if (!is_file($file) || filemtime($file) < time() - self::JOB_AGE) {
+        $directory = $this->jobDirectory($jobId);
+        $file = $directory . '/job.json';
+        if (!$this->isJobDirectory($directory) || is_link($file) || !is_file($file)
+            || filemtime($file) < time() - self::JOB_AGE || !$this->protectJobDirectory($directory)) {
             throw new RuntimeException($this->language->get('error_job'));
         }
         $job = json_decode(file_get_contents($file), true);
@@ -583,10 +747,14 @@ class ControllerExtensionModuleNothizProductImport extends Controller {
     }
 
     private function writeJob($directory, $job) {
-        $json = json_encode($job, JSON_UNESCAPED_UNICODE | JSON_INVALID_UTF8_SUBSTITUTE);
-        $temporaryPath = $directory . '/job.tmp';
-        if ($json === false || file_put_contents($temporaryPath, $json) !== strlen($json)
-            || !rename($temporaryPath, $directory . '/job.json')) {
+        $this->writeState($directory . '/job.json', $job);
+    }
+
+    private function writeState(string $path, array $data): void {
+        $json = json_encode($data, JSON_UNESCAPED_UNICODE | JSON_INVALID_UTF8_SUBSTITUTE);
+        $temporaryPath = $path . '.tmp';
+        if ($json === false || @file_put_contents($temporaryPath, $json) !== strlen($json)
+            || !@rename($temporaryPath, $path)) {
             throw new RuntimeException($this->language->get('error_storage'));
         }
     }
@@ -596,12 +764,12 @@ class ControllerExtensionModuleNothizProductImport extends Controller {
         foreach (glob($pattern, GLOB_ONLYDIR) ?: [] as $directory) {
             $stateFile = $directory . '/job.json';
             if (!preg_match('/\Anothiz_product_import_[0-9a-f]{32}\z/', basename($directory))
-                || is_link($directory)
+                || !$this->isJobDirectory($directory) || is_link($stateFile)
                 || filemtime(is_file($stateFile) ? $stateFile : $directory) >= time() - self::JOB_AGE) {
                 continue;
             }
 
-            $lock = @fopen($directory . '/lock', 'c');
+            $lock = !is_link($directory . '/lock') ? @fopen($directory . '/lock', 'c') : false;
             if ($lock === false) {
                 continue;
             }
@@ -614,7 +782,7 @@ class ControllerExtensionModuleNothizProductImport extends Controller {
                 if (is_file($stateFile) && filemtime($stateFile) >= time() - self::JOB_AGE) {
                     continue;
                 }
-                foreach (self::TEMP_FILES as $name) {
+                foreach ($this->temporaryFiles($directory) as $name) {
                     if (is_file($directory . '/' . $name)) {
                         @unlink($directory . '/' . $name);
                     }
@@ -627,8 +795,59 @@ class ControllerExtensionModuleNothizProductImport extends Controller {
         }
     }
 
+    private function issueText(array $issue, string $fallback = ''): string {
+        $code = $issue['code'] ?? '';
+        $key = 'issue_' . $code;
+        $message = $this->language->get($key);
+        if ($code === '' || !is_string($message) || $message === $key) {
+            return $fallback !== '' ? $fallback : $this->language->get('error_row');
+        }
+        try {
+            $params = $issue['params'] ?? [];
+            if ($code === 'field_length' && ($params[0] ?? '') === 'Category folder name') {
+                $params[0] = $this->language->get('text_category_folder');
+            }
+            $formatted = vsprintf($message, $params);
+            return is_string($formatted) ? $formatted : $message;
+        } catch (Throwable $exception) {
+            return $fallback !== '' ? $fallback : $this->language->get('error_row');
+        }
+    }
+
+    private function rowMessage(array $row): string {
+        if (!empty($row['issues'])) {
+            return implode("\n", array_map(function ($issue) {
+                return $this->issueText($issue);
+            }, $row['issues']));
+        }
+        $previous = (string)($row['message'] ?? '');
+        return isset($row['issue']) ? $this->issueText($row['issue'], $previous) : $previous;
+    }
+
+    private function isJobDirectory(string $path): bool {
+        $root = realpath(DIR_UPLOAD);
+        $directory = realpath($path);
+        return $root !== false && $directory !== false && !is_link($path)
+            && is_dir($directory) && dirname($directory) === $root && basename($directory) === basename($path);
+    }
+
+    private function protectJobDirectory(string $path): bool {
+        require_once DIR_SYSTEM . 'library/nothiz_product_import/private_storage.php';
+        return $this->isJobDirectory($path) && NothizProductImportPrivateStorage::protect($path);
+    }
+
+    private function temporaryFiles(string $directory): array {
+        $files = self::TEMP_FILES;
+        foreach (@scandir($directory) ?: [] as $name) {
+            if (preg_match('/\\Arow-[1-9][0-9]*\\.receipt(?:\\.tmp)?\\z/', $name)) {
+                $files[] = $name;
+            }
+        }
+        return array_merge($files, ['index.html', '.htaccess']);
+    }
+
     private function deleteJob($directory) {
-        foreach (array_merge(self::TEMP_FILES, ['lock']) as $name) {
+        foreach (array_merge($this->temporaryFiles($directory), ['lock']) as $name) {
             $path = $directory . '/' . $name;
             if (is_file($path)) {
                 unlink($path);
@@ -638,7 +857,7 @@ class ControllerExtensionModuleNothizProductImport extends Controller {
     }
 
     private function summary($job) {
-        $counts = ['ready' => 0, 'created' => 0, 'skipped' => 0, 'failed' => 0];
+        $counts = ['ready' => 0, 'created' => 0, 'skipped' => 0, 'duplicate' => 0, 'failed' => 0];
         foreach ($job['items'] as $item) {
             ++$counts[$item['status']];
         }
@@ -653,7 +872,7 @@ class ControllerExtensionModuleNothizProductImport extends Controller {
         $filters = ['all' => [
             'id' => 'all', 'label' => $text['text_filter_all'], 'count' => $summary['total'], 'url' => $this->link(self::ROUTE),
         ]];
-        foreach (['ready', 'created', 'failed', 'skipped'] as $state) {
+        foreach (['ready', 'created', 'failed', 'duplicate', 'skipped'] as $state) {
             if (($state === 'created' && !$summary['started']) || ($state === 'ready' && $summary['started'] && $summary['done'])) {
                 continue;
             }

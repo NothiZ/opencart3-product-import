@@ -1,4 +1,7 @@
 <?php
+
+require_once DIR_SYSTEM . 'library/nothiz_product_import/issue.php';
+
 class ModelExtensionModuleNothizProductImport extends Model {
     private const DEFAULT_QUANTITY = 1000;
     private const TEXT_BYTES = 65535;
@@ -6,7 +9,7 @@ class ModelExtensionModuleNothizProductImport extends Model {
     /**
      * Build a read-only preview. Rows that pass workbook validation still need a ZIP image match.
      */
-    public function preflight(array $rows, array $images, bool $imagesChecked = true): array {
+    public function preflight(array $rows, array $images, bool $imagesChecked = true, array $imageIssues = []): array {
         $items = [];
         $seen = [];
         $imageGroups = [];
@@ -14,40 +17,54 @@ class ModelExtensionModuleNothizProductImport extends Model {
             $key = $this->fold((string)$sku);
             $imageGroups[$key] = array_key_exists($key, $imageGroups) ? null : $group;
         }
+        $issuesBySku = [];
+        foreach ($imageIssues as $sku => $issues) {
+            $key = $this->fold((string)$sku);
+            $issuesBySku[$key] = array_merge($issuesBySku[$key] ?? [], $issues);
+        }
 
         foreach ($rows as $row) {
             $data = $row['data'];
             $sku = $this->cell($data, 'sku');
             $title = $this->cell($data, 'title');
             $item = ['row' => $row['row'], 'sku' => $sku, 'title' => $title];
+            $key = $this->fold($sku);
+            if (isset($seen[$key])) {
+                $items[] = $item + $this->result('duplicate', 'duplicate_workbook', [$seen[$key]]);
+                continue;
+            }
+            if ($sku !== '') {
+                $seen[$key] = $row['row'];
+            }
 
             try {
                 $storedSku = $this->requiredText($sku, 'sku', 64);
-                $key = $this->fold($sku);
-                if (isset($seen[$key])) {
-                    $items[] = $item + $this->result('skipped', 'SKU is already listed in the workbook.');
-                    continue;
-                }
-                $existing = $this->existingProduct($sku, $storedSku);
+                $existing = $this->existingProducts($sku, $storedSku);
                 if ($existing) {
-                    $seen[$key] = true;
-                    $items[] = $item + $this->skipExistingProduct($existing);
+                    $items[] = $item + $this->existingResult($existing);
                     continue;
                 }
 
-                $group = $images[$sku] ?? $imageGroups[$key] ?? null;
-                if ($imagesChecked && empty($group['entries'])) {
-                    throw new InvalidArgumentException('No unambiguous image folder matches this SKU.');
+                $group = $imagesChecked ? ($imageGroups[$key] ?? null) : null;
+                $product = $this->prepareProduct($data, $title, $storedSku, $group ?? ['categories' => [], 'entries' => []]);
+                if (!$imagesChecked) {
+                    $items[] = $item + $this->result('awaiting_images', 'awaiting_images');
+                    continue;
                 }
-                $product = $this->prepareProduct($data, $title, $storedSku, $imagesChecked ? $group : ['categories' => [], 'entries' => []]);
-                $seen[$key] = true;
-                if ($imagesChecked) {
-                    $items[] = $item + ['product' => $product] + $this->result('ready', 'Ready to import.');
-                } else {
-                    $items[] = $item + $this->result('awaiting_images', 'Waiting for image ZIP validation.');
+                if (!empty($issuesBySku[$key])) {
+                    $items[] = $item + ['status' => 'failed', 'issue' => $issuesBySku[$key][0], 'issues' => $issuesBySku[$key]];
+                    continue;
                 }
-            } catch (InvalidArgumentException $e) {
-                $items[] = $item + $this->result('failed', $e->getMessage());
+                if (!$product['entries']) {
+                    $items[] = $item + $this->result('failed', 'image_folder_missing');
+                    continue;
+                }
+                $product['image_layout'] = 'zip';
+                $reused = (int)($group['reused'] ?? 0);
+                $items[] = $item + ['product' => $product] + ($reused > 0
+                    ? $this->result('ready', 'ready_images_reused', [$reused]) : $this->result('ready', 'ready'));
+            } catch (NothizProductImportIssue $e) {
+                $items[] = $item + ['status' => 'failed', 'issue' => $e->issue()];
             }
         }
 
@@ -60,40 +77,52 @@ class ModelExtensionModuleNothizProductImport extends Model {
     public function importItem(array $item, string $zipPath, string $jobId): array {
         $this->load->model('catalog/product');
         $this->load->model('catalog/category');
+        $prepared = $item['product'];
+        $row = (int)$item['row'];
 
-        // SKU is not unique in stock OpenCart. One lock also protects shared catalog definitions.
+        // One lock serializes identifier checks and updates to shared catalog definitions.
         $database = defined('DB_DATABASE') ? DB_DATABASE : '';
         $lock = 'nothiz-import-' . substr(hash('sha256', $database . ':' . DB_PREFIX), 0, 40);
-        $lockResult = $this->db->query("SELECT GET_LOCK('" . $lock . "', 5) AS acquired");
-        if ((int)($lockResult->row['acquired'] ?? 0) !== 1) {
-            return $this->result('failed', 'Another import is writing to the catalog. Run the import again.');
+        $lockResult = $this->db->query("SELECT GET_LOCK('" . $lock . "', 0) AS acquired");
+        $acquired = (string)($lockResult->row['acquired'] ?? '');
+        if ($acquired === '0') {
+            return ['status' => 'deferred'];
+        }
+        if ($acquired !== '1') {
+            throw new NothizProductImportIssue('catalog_lock_error', [], 'OpenCart could not acquire the catalog import lock.');
         }
 
+        $publication = ($prepared['image_layout'] ?? '') === 'zip' ? [] : null;
+        $receiptPath = $publication === null ? '' : dirname($zipPath) . '/row-' . $row . '.receipt';
         $paths = [];
         $productId = 0;
         $productStarted = false;
         $transactionStarted = false;
-        $marker = 'nothiz-import-' . substr(hash('sha256', $jobId . ':' . $item['row']), 0, 40);
+        $finalizing = false;
+        $marker = 'nothiz-import-' . substr(hash('sha256', $jobId . ':' . $row), 0, 40);
 
         try {
-            $prepared = $item['product'];
+            $existing = $this->existingProducts($item['sku'], $prepared['sku'], $marker);
+            if (count($existing) > 1) {
+                return $this->existingResult($existing);
+            }
             $this->removeIncompleteProduct($marker, $prepared['sku']);
-            $existing = $this->existingProduct($item['sku'], $prepared['sku']);
             if ($existing) {
-                // A request can finish the row before the controller saves its cursor.
-                $imagePrefix = NothizProductImportFiles::IMPORT_IMAGE_PATH . '/' . $jobId . '/' . $item['row'] . '/';
-                if (strpos((string)$existing['image'], $imagePrefix) === 0) {
-                    return $this->created((int)$existing['product_id']);
+                $product = $existing[0];
+                if ($this->isCompletedProduct($product, $prepared, $receiptPath, $jobId, $row)) {
+                    return $this->created((int)$product['product_id']);
                 }
-                return $this->skipExistingProduct($existing);
+                return $this->existingResult($existing);
             }
 
             $languageIds = $this->languageIds();
             $storeId = max(0, (int)$this->config->get('config_store_id'));
-            NothizProductImportFiles::discardRowImages(DIR_IMAGE, $jobId, $item['row']);
-            $paths = NothizProductImportFiles::publishImages($zipPath, $prepared['entries'], DIR_IMAGE, $jobId, $item['row']);
+            if ($publication === null) {
+                NothizProductImportFiles::discardRowImages(DIR_IMAGE, $jobId, $row);
+            }
+            $paths = NothizProductImportFiles::publishImages($zipPath, $prepared['entries'], DIR_IMAGE, $jobId, $row, $publication);
             if (!$paths) {
-                throw new RuntimeException('No product images could be published.');
+                throw new NothizProductImportIssue('publish_no_images', [], 'No product images could be published.');
             }
 
             $this->db->query('START TRANSACTION');
@@ -102,27 +131,39 @@ class ModelExtensionModuleNothizProductImport extends Model {
             $productStarted = true;
             $productId = (int)$this->model_catalog_product->addProduct($product);
             if (!$productId) {
-                throw new RuntimeException('OpenCart returned no product ID.');
+                throw new NothizProductImportIssue('product_id_missing', [], 'OpenCart returned no product ID.');
             }
 
-            // Keep unfinished products off the storefront, including on the stock MyISAM schema.
+            // Persist ownership before making the product visible, including on MyISAM.
+            if ($receiptPath !== '') {
+                $this->writeReceipt($receiptPath, $jobId, $productId, $prepared['sku'], $paths[0]);
+            }
+            $finalizing = true;
             $this->db->query("UPDATE `" . DB_PREFIX . "product` SET model = '" . $this->db->escape($prepared['sku'])
                 . "', status = " . $prepared['status'] . " WHERE product_id = " . $productId);
             $this->db->query('COMMIT');
             return $this->created($productId);
         } catch (Throwable $e) {
-            try {
-                if ($transactionStarted) {
-                    $this->db->query('ROLLBACK');
+            if ($transactionStarted) {
+                $this->db->query('ROLLBACK');
+            }
+            if ($finalizing) {
+                // A failed COMMIT response may follow a completed write.
+                $product = $this->db->query("SELECT product_id, sku, model, status, image FROM `" . DB_PREFIX . "product` WHERE product_id = " . $productId)->row;
+                if ($product && $product['model'] !== $marker) {
+                    if ($this->hasFinalIdentifiers($product, $prepared) && $product['image'] === $paths[0]) {
+                        return $this->created($productId);
+                    }
+                    throw $e;
                 }
-                // MyISAM ignores transactions. The marker identifies only this row's incomplete write.
-                if ($productId) {
-                    $this->model_catalog_product->deleteProduct($productId);
-                } elseif ($productStarted) {
-                    $this->removeIncompleteProduct($marker, $item['product']['sku']);
-                }
-            } finally {
+            }
+            if ($productStarted) {
+                $this->removeIncompleteProduct($marker, $prepared['sku']);
+            }
+            if ($publication === null) {
                 NothizProductImportFiles::discardImages($paths, DIR_IMAGE);
+            } else {
+                NothizProductImportFiles::discardPublishedImages($publication, DIR_IMAGE);
             }
             throw $e;
         } finally {
@@ -138,10 +179,10 @@ class ModelExtensionModuleNothizProductImport extends Model {
         $status = strtolower($this->cell($data, 'status'));
         if ($quantity !== '' && (!is_numeric($quantity) || (float)$quantity < 0 ||
             (float)$quantity > 2147483647 || floor((float)$quantity) !== (float)$quantity)) {
-            throw new InvalidArgumentException('quantity must be a whole number between 0 and 2147483647.');
+            throw new NothizProductImportIssue('invalid_quantity', [], 'quantity must be a whole number between 0 and 2147483647.');
         }
         if (!in_array($status, ['', '0', '1', 'false', 'true', 'no', 'yes'], true)) {
-            throw new InvalidArgumentException('status must be 0, 1, false, true, no, or yes.');
+            throw new NothizProductImportIssue('invalid_status', [], 'status must be 0, 1, false, true, no, or yes.');
         }
 
         $categories = [];
@@ -186,7 +227,7 @@ class ModelExtensionModuleNothizProductImport extends Model {
             $storedName = $this->requiredText($name, 'variant_name' . $suffix, 64);
             $nameKey = $this->fold($name);
             if (isset($seen[$nameKey])) {
-                throw new InvalidArgumentException('An option name is repeated in this row.');
+                throw new NothizProductImportIssue('duplicate_option_name', [], 'An option name is repeated in this row.');
             }
             $seen[$nameKey] = true;
             $values = preg_split('/[,\r\n|]+/u', $value, -1, PREG_SPLIT_NO_EMPTY);
@@ -195,14 +236,16 @@ class ModelExtensionModuleNothizProductImport extends Model {
                 return $part !== '';
             }));
             if (!$values) {
-                throw new InvalidArgumentException('variant_value' . $suffix . ' requires at least one option value.');
+                throw new NothizProductImportIssue('option_value_required', ['variant_value' . $suffix],
+                    'variant_value' . $suffix . ' requires at least one option value.');
             }
             $optionValues = [];
             $used = [];
             foreach ($values as $index => $valueName) {
                 $valueKey = $this->fold($valueName);
                 if (isset($used[$valueKey])) {
-                    throw new InvalidArgumentException('An option value is repeated in variant_value' . $suffix . '.');
+                    throw new NothizProductImportIssue('duplicate_option_value', ['variant_value' . $suffix],
+                        'An option value is repeated in variant_value' . $suffix . '.');
                 }
                 $used[$valueKey] = true;
                 $adjustment = trim($prices[$index] ?? '');
@@ -238,14 +281,15 @@ class ModelExtensionModuleNothizProductImport extends Model {
     private function requiredText(string $value, string $field, int $limit): string {
         $stored = $this->encode($value);
         if ($stored === '' || preg_match_all('/./us', $stored) > $limit) {
-            throw new InvalidArgumentException($field . ' must contain 1 to ' . $limit . ' characters after escaping.');
+            throw new NothizProductImportIssue('field_length', [$field, $limit],
+                $field . ' must contain 1 to ' . $limit . ' characters after escaping.');
         }
         return $stored;
     }
 
     private function limitedText(string $value, string $field): string {
         if (strlen($value) > self::TEXT_BYTES) {
-            throw new InvalidArgumentException($field . ' is too long for OpenCart.');
+            throw new NothizProductImportIssue('field_too_long', [$field], $field . ' is too long for OpenCart.');
         }
         return $value;
     }
@@ -268,23 +312,33 @@ class ModelExtensionModuleNothizProductImport extends Model {
         // OpenCart writes prices by casting them to float, and the database stores DECIMAL(15,4).
         if (!is_numeric($value) || !is_finite($amount) || (!$allowNegative && $amount < 0) ||
             abs($amount) > 99999999999.9999 || (float)(string)abs($amount) >= 100000000000) {
-            throw new InvalidArgumentException($field . ' must be a price within the OpenCart decimal limit.');
+            throw new NothizProductImportIssue('invalid_price', [$field], $field . ' must be a price within the OpenCart decimal limit.');
         }
         return round($amount, 4);
     }
 
-    private function existingProduct(string $sku, string $storedSku): array {
-        $sql = "SELECT product_id, image FROM `" . DB_PREFIX . "product` WHERE sku = '" . $this->db->escape($storedSku) . "'";
+    private function existingProducts(string $sku, string $storedSku, string $marker = ''): array {
+        $stored = "'" . $this->db->escape($storedSku) . "'";
+        $identifiers = $stored;
         if ($sku !== $storedSku) {
-            $sql .= " OR sku = '" . $this->db->escape($sku) . "'";
+            $identifiers .= ", '" . $this->db->escape($sku) . "'";
         }
-        return $this->db->query($sql . ' LIMIT 1')->row;
+        $sql = "SELECT product_id, sku, model, status, image FROM `" . DB_PREFIX . "product`
+            WHERE (sku IN (" . $identifiers . ") OR model IN (" . $identifiers . "))";
+        if ($marker !== '') {
+            // This job's unpublished product does not compete with live catalog identifiers.
+            $sql .= " AND (BINARY model <> '" . $marker . "' OR BINARY sku <> " . $stored . " OR status <> 0)";
+        }
+        return $this->db->query($sql . ' LIMIT 2')->rows;
     }
 
-    private function skipExistingProduct(array $product): array {
-        $result = $this->result('skipped', 'SKU already exists in OpenCart.');
+    private function existingResult(array $products): array {
+        if (count($products) > 1) {
+            return $this->result('failed', 'identifier_conflict');
+        }
+        $result = $this->result('skipped', 'existing_product');
         $result['existing_image'] = false;
-        $image = (string)($product['image'] ?? '');
+        $image = (string)($products[0]['image'] ?? '');
         $root = realpath(DIR_IMAGE);
         if ($root !== false && $image !== '' && strpos($image, "\0") === false) {
             // Resolve the stored path before checking that it stays inside the image directory.
@@ -296,10 +350,55 @@ class ModelExtensionModuleNothizProductImport extends Model {
     }
 
     private function removeIncompleteProduct(string $marker, string $sku): void {
-        $query = $this->db->query("SELECT product_id, image FROM `" . DB_PREFIX . "product` WHERE model = '" . $marker
-            . "' AND sku = '" . $this->db->escape($sku) . "' AND status = 0 LIMIT 1");
+        $query = $this->db->query("SELECT product_id FROM `" . DB_PREFIX . "product` WHERE BINARY model = '" . $marker
+            . "' AND BINARY sku = '" . $this->db->escape($sku) . "' AND status = 0 LIMIT 2");
+        if ($query->num_rows > 1) {
+            throw new NothizProductImportIssue('incomplete_product_conflict', [], 'Multiple products match the same incomplete import row.');
+        }
         if ($query->num_rows) {
             $this->model_catalog_product->deleteProduct((int)$query->row['product_id']);
+        }
+    }
+
+    private function isCompletedProduct(array $product, array $prepared, string $receiptPath, string $jobId, int $row): bool {
+        if (!$this->hasFinalIdentifiers($product, $prepared)) {
+            return false;
+        }
+        if ($receiptPath === '') {
+            $prefix = NothizProductImportFiles::IMPORT_IMAGE_PATH . '/' . $jobId . '/' . $row . '/';
+            return strpos((string)$product['image'], $prefix) === 0;
+        }
+        if (is_link($receiptPath) || !is_file($receiptPath)) {
+            return false;
+        }
+        $contents = @file_get_contents($receiptPath, false, null, 0, 4096);
+        $receipt = $contents === false ? null : json_decode($contents, true);
+        return ($receipt['job'] ?? null) === $jobId
+            && ($receipt['product_id'] ?? null) === (int)$product['product_id']
+            && ($receipt['sku'] ?? null) === $prepared['sku']
+            && ($receipt['image'] ?? null) === $product['image'];
+    }
+
+    private function hasFinalIdentifiers(array $product, array $prepared): bool {
+        return $product['model'] === $prepared['sku'] && $product['sku'] === $prepared['sku']
+            && (int)$product['status'] === $prepared['status'];
+    }
+
+    private function writeReceipt(string $path, string $jobId, int $productId, string $sku, string $image): void {
+        $temporary = $path . '.tmp';
+        if (is_link($path) || is_link($temporary) || (file_exists($temporary) && (!is_file($temporary) || !@unlink($temporary)))) {
+            throw new NothizProductImportIssue('row_receipt_storage', [], 'Unable to prepare the import receipt.');
+        }
+        $contents = json_encode(['job' => $jobId, 'product_id' => $productId, 'sku' => $sku, 'image' => $image]);
+        $file = $contents === false ? false : @fopen($temporary, 'xb');
+        if ($file === false) {
+            throw new NothizProductImportIssue('row_receipt_storage', [], 'Unable to open the import receipt.');
+        }
+        $written = @fwrite($file, $contents);
+        $closed = @fclose($file);
+        if ($written !== strlen($contents) || !$closed || !@rename($temporary, $path)) {
+            @unlink($temporary);
+            throw new NothizProductImportIssue('row_receipt_storage', [], 'Unable to save the import receipt.');
         }
     }
 
@@ -312,7 +411,7 @@ class ModelExtensionModuleNothizProductImport extends Model {
         }
         $ids = array_values(array_unique($ids));
         if (!$ids) {
-            throw new RuntimeException('OpenCart has no active content language.');
+            throw new NothizProductImportIssue('content_language_missing', [], 'OpenCart has no active content language.');
         }
         return $ids;
     }
@@ -364,7 +463,7 @@ class ModelExtensionModuleNothizProductImport extends Model {
                     'category_store' => [$storeId]
                 ]);
                 if (!$categoryId) {
-                    throw new RuntimeException('OpenCart returned no category ID.');
+                    throw new NothizProductImportIssue('category_id_missing', [], 'OpenCart returned no category ID.');
                 }
             } else {
                 $categoryId = (int)$match['category_id'];
@@ -413,7 +512,7 @@ class ModelExtensionModuleNothizProductImport extends Model {
 
                 // MySQL collation can match different workbook spellings to the same option value.
                 if (isset($values[$valueId])) {
-                    throw new RuntimeException('Two workbook values match the same OpenCart option value.');
+                    throw new NothizProductImportIssue('option_value_catalog_conflict', [], 'Two workbook values match the same OpenCart option value.');
                 }
                 $values[$valueId] = [
                     'option_value_id' => $valueId, 'quantity' => $quantity, 'subtract' => 0,
@@ -422,7 +521,7 @@ class ModelExtensionModuleNothizProductImport extends Model {
                 ];
             }
             if (isset($options[$optionId])) {
-                throw new RuntimeException('Two workbook variants match the same OpenCart option.');
+                throw new NothizProductImportIssue('option_catalog_conflict', [], 'Two workbook variants match the same OpenCart option.');
             }
             $options[$optionId] = [
                 'option_id' => $optionId, 'type' => $type, 'required' => 1,
@@ -468,7 +567,8 @@ class ModelExtensionModuleNothizProductImport extends Model {
         $this->db->query("INSERT INTO `" . DB_PREFIX . $table . "` SET " . $fields);
         $id = (int)$this->db->getLastId();
         if (!$id) {
-            throw new RuntimeException('OpenCart returned no ID for the imported ' . str_replace('_', ' ', $table) . '.');
+            throw new NothizProductImportIssue('catalog_reference_id_missing', [],
+                'OpenCart returned no ID for the imported ' . str_replace('_', ' ', $table) . '.');
         }
         $this->fillNames($table, $id, $name, $languageIds, $descriptionFields);
         return $id;
@@ -482,10 +582,10 @@ class ModelExtensionModuleNothizProductImport extends Model {
     }
 
     private function created(int $productId): array {
-        return $this->result('created', 'Created OpenCart product #' . $productId . '.');
+        return $this->result('created', 'created_product', [$productId]);
     }
 
-    private function result(string $status, string $message): array {
-        return ['status' => $status, 'message' => $message];
+    private function result(string $status, string $code, array $params = []): array {
+        return ['status' => $status, 'issue' => ['code' => $code, 'params' => $params]];
     }
 }

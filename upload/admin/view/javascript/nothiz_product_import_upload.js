@@ -7,6 +7,84 @@
     var submit = form.querySelector('button[type="submit"]');
     var status = document.getElementById('nothiz-upload-status');
     var running = false;
+    var resume = document.getElementById('nothiz-resume-scan');
+    var pending = form.dataset.pendingScan;
+    var run = document.getElementById('nothiz-run');
+
+    function warnBeforeLeaving(event) {
+        event.preventDefault();
+        event.returnValue = '';
+    }
+
+    function setRunning(value) {
+        running = value;
+        submit.disabled = value;
+        resume.disabled = value;
+        if (run) run.disabled = value;
+        inputs.forEach(function (input) { input.disabled = value; });
+        if (value) window.addEventListener('beforeunload', warnBeforeLeaving);
+        else window.removeEventListener('beforeunload', warnBeforeLeaving);
+    }
+
+    async function scan(params, output) {
+        var busyAttempts = 0;
+        output.textContent = form.dataset.scanning;
+        while (true) {
+            var reply = await readReply(await fetch(form.dataset.scan, { method: 'POST', body: params }));
+            if (reply.busy) {
+                if (++busyAttempts > 20) throw new Error(form.dataset.uploadError);
+                await new Promise(function (resolve) { window.setTimeout(resolve, 500); });
+                continue;
+            }
+            busyAttempts = 0;
+            output.textContent = form.dataset.scanning + ' ' + reply.processed + ' / ' + reply.total;
+            if (reply.done) return;
+        }
+    }
+
+    function openPreview(upload) {
+        document.getElementById('nothiz-staged-upload').value = upload;
+        window.removeEventListener('beforeunload', warnBeforeLeaving);
+        HTMLFormElement.prototype.submit.call(form);
+    }
+
+    async function finishScan() {
+        await scan(new URLSearchParams({ upload: pending }), status);
+        openPreview(pending);
+    }
+
+    resume.addEventListener('click', async function () {
+        if (running || submit.disabled || !pending) return;
+        setRunning(true);
+        try {
+            await finishScan();
+        } catch (error) {
+            status.textContent = error.message || form.dataset.uploadError;
+            setRunning(false);
+        }
+    });
+
+    var wrapper = document.getElementById('nothiz-wrapper');
+    if (wrapper) {
+        wrapper.addEventListener('click', async function () {
+            if (running || submit.disabled) return;
+            var output = document.getElementById('nothiz-wrapper-status');
+            setRunning(true);
+            wrapper.disabled = true;
+            try {
+                await scan(new URLSearchParams({
+                    job: wrapper.dataset.job,
+                    strip_products: wrapper.dataset.strip
+                }), output);
+                window.removeEventListener('beforeunload', warnBeforeLeaving);
+                window.location.assign(form.action);
+            } catch (error) {
+                output.textContent = error.message || form.dataset.uploadError;
+                wrapper.disabled = false;
+                setRunning(false);
+            }
+        });
+    }
     var minChunk = 16 * 1024;
     var hashChunk = 4 * 1024 * 1024;
     var inputs = [document.getElementById('nothiz-workbook'), document.getElementById('nothiz-images')];
@@ -124,11 +202,7 @@
             meta.set('images_size', images.size);
         }
 
-        running = true;
-        submit.disabled = true;
-        inputs.forEach(function (input) { input.disabled = true; });
-        var confirm = document.getElementById('nothiz-run');
-        if (confirm) confirm.disabled = true;
+        setRunning(true);
 
         try {
             var begun = await fetch(form.dataset.begin, { method: 'POST', body: meta });
@@ -146,17 +220,16 @@
                 var archive = await requestUploadPlan(stage.upload, await fingerprint(images));
                 if (!archive.reused) await uploadFile(images, 'images', stage, transfer);
                 else status.textContent = form.dataset.archiveReused;
+                pending = stage.upload;
+                resume.hidden = false;
+                await finishScan();
             } else {
                 status.textContent = form.dataset.catalogReused;
+                openPreview(stage.upload);
             }
-            document.getElementById('nothiz-staged-upload').value = stage.upload;
-            // The final preview request contains the staging ID and no file bodies.
-            HTMLFormElement.prototype.submit.call(form);
         } catch (error) {
             status.textContent = error.message || form.dataset.uploadError;
-            running = false;
-            submit.disabled = false;
-            inputs.forEach(function (input) { input.disabled = false; });
+            setRunning(false);
         }
     });
 }());

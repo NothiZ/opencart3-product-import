@@ -52,11 +52,16 @@ try {
     cacheCheck($cache->reuse($sha, $bytes, $destination) === null && !file_exists($destination), 'A miss wrote an archive');
     cacheCheck($cache->reuse($sha, $bytes, $destination, $source) === ['index' => null], 'An exact legacy ZIP was not attached');
     cacheCheck(hash_file('sha256', $destination) === $sha, 'Legacy ZIP bytes differ');
+    cacheCheck(is_file(dirname($source) . '/.htaccess') && is_file(dirname($source) . '/index.html'), 'Legacy reuse did not backfill directory protection');
     cacheCheck($cache->reuse(str_repeat('a', 64), $bytes, cacheJob($root), $source) === null, 'A legacy ZIP with a different digest was accepted');
     cacheCheck($cache->reuse($sha, $bytes + 1, cacheJob($root), $source) === null, 'A legacy ZIP with a different length was accepted');
 
     $cache->remember($sha, $source, $index);
+    cacheCheck(is_file($cacheDirectory . '/.htaccess') && strpos(file_get_contents($cacheDirectory . '/.htaccess'), 'Require all denied') !== false, 'The cache did not block direct Apache access');
+    cacheCheck(is_file($cacheDirectory . '/index.html') && file_get_contents($cacheDirectory . '/index.html') === '', 'The cache did not create a blank default page');
+    unlink($cacheDirectory . '/.htaccess');
     $cache->remember($sha, $source, ['other' => $index['sku']]);
+    cacheCheck(is_file($cacheDirectory . '/.htaccess'), 'An existing cache directory was not protected');
     unlink($source);
     $cache = new NothizProductImportArchiveCache($root);
     $freshJob = cacheJob($root);
@@ -93,9 +98,26 @@ try {
     cacheCheck(count(glob($cacheDirectory . '/*.zip')) === NothizProductImportArchiveCache::MAX_ARCHIVES, 'The cache exceeded its archive count');
     cacheCheck(!file_exists($cacheDirectory . '/' . $first . '.json'), 'The oldest entry survived quota cleanup');
 
-    file_put_contents($cacheDirectory . '/' . $digest . '.json', '{"index":{"sku":[]}}');
-    cacheCheck($cache->reuse($digest, $size, cacheJob($root)) === null, 'The cache accepted a corrupt index');
-    cacheCheck(!file_exists($cacheDirectory . '/' . $digest . '.zip'), 'A corrupt cache entry was left behind');
+    $entry = $cacheDirectory . '/' . $digest;
+    $versionOne = json_encode(['version' => 1, 'sha256' => $digest, 'bytes' => $size, 'index' => $index]);
+    foreach ([$versionOne, '{"index":{"sku":[]}}', '', null] as $oldManifest) {
+        if ($oldManifest === null) {
+            unlink($entry . '.json');
+        } else {
+            file_put_contents($entry . '.json', $oldManifest);
+        }
+        $replacement = cacheJob($root);
+        cacheCheck($cache->reuse($digest, $size, $replacement) === ['index' => null], 'A verified ZIP with an obsolete or invalid index was not reused for rescanning');
+        cacheCheck(hash_file('sha256', $replacement) === $digest && hash_file('sha256', $entry . '.zip') === $digest, 'Index recovery lost the verified ZIP');
+        $cache->remember($digest, $replacement, $index);
+        cacheCheck($cache->reuse($digest, $size, cacheJob($root)) === ['index' => $index], 'Rescanning did not replace the unusable index');
+    }
+
+    unlink($entry . '.json');
+    mkdir($entry . '.json');
+    $cache->remember($digest, $job, $index);
+    cacheCheck(is_dir($entry . '.json') && !file_exists($entry . '.json.cache-tmp') && hash_file('sha256', $entry . '.zip') === $digest, 'A failed index replacement left a temporary file or lost the verified ZIP');
+    rmdir($entry . '.json');
 
     $cache->remember($digest, $job, $index);
     unlink($cacheDirectory . '/' . $digest . '.zip');
@@ -116,6 +138,23 @@ try {
     if (@symlink($cacheDirectory, $blocked . '/nothiz_product_import_archive_cache')) {
         $blockedCache->remember($legacySha, $blockedSource, $index);
         cacheCheck(!file_exists($cacheDirectory . '/' . $legacySha . '.zip'), 'Cache publication followed a symbolic link');
+    }
+
+    $private = dirname(cacheJob($root));
+    cacheCheck(NothizProductImportPrivateStorage::protect($private), 'A job directory could not be protected');
+    cacheCheck(NothizProductImportPrivateStorage::protect($private), 'A protected job directory could not be reopened');
+    file_put_contents($private . '/index.html', 'custom content');
+    cacheCheck(!NothizProductImportPrivateStorage::protect($private) && file_get_contents($private . '/index.html') === 'custom content', 'Directory protection overwrote a custom index page');
+    file_put_contents($private . '/.htaccess', 'custom rules');
+    cacheCheck(!NothizProductImportPrivateStorage::protect($private) && file_get_contents($private . '/.htaccess') === 'custom rules', 'Directory protection overwrote custom rules');
+    unlink($private . '/.htaccess');
+    $outside = $root . '/outside';
+    file_put_contents($outside, 'untouched');
+    if (@symlink($outside, $private . '/.htaccess')) {
+        cacheCheck(!NothizProductImportPrivateStorage::protect($private) && file_get_contents($outside) === 'untouched', 'Directory protection followed a symbolic link');
+    }
+    if (@symlink($private, $root . '/linked-job')) {
+        cacheCheck(!NothizProductImportPrivateStorage::protect($root . '/linked-job/'), 'Directory protection followed a symbolic directory link');
     }
 
     echo "Archive cache checks passed\n";

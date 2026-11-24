@@ -65,29 +65,63 @@
     var info = document.getElementById('nothiz-progress');
     var filters = panel.querySelector('.npi-filters');
     var busyAttempts = 0;
+    var deferredAttempts = 0;
+    var paused = run.dataset.isPaused === '1';
+    var pause = document.getElementById('nothiz-pause');
+    var confirmation = $('#nothiz-confirm-modal');
+
+    function warnBeforeLeaving(event) {
+        event.preventDefault();
+        event.returnValue = '';
+    }
+
+    pause.addEventListener('click', function () {
+        pause.disabled = true;
+        info.classList.remove('sr-only');
+        info.textContent = run.dataset.pausing;
+        $.ajax({
+            url: run.dataset.pause,
+            type: 'POST',
+            dataType: 'json',
+            data: { job: run.dataset.job }
+        }).done(function (result) {
+            if (result.error && !pause.hidden) {
+                info.textContent = result.error;
+                pause.disabled = false;
+            }
+        }).fail(function () {
+            if (pause.hidden) return;
+            info.textContent = run.dataset.error;
+            pause.disabled = false;
+        });
+    });
 
     function stop(message) {
         info.classList.remove('sr-only');
         info.textContent = message || run.dataset.error;
+        hint.textContent = panel.dataset.resumeHint;
         heading.textContent = panel.dataset.pausedTitle;
         filters.hidden = false;
+        window.removeEventListener('beforeunload', warnBeforeLeaving);
+        pause.hidden = true;
+        run.textContent = run.dataset.resume;
         run.hidden = false;
         run.disabled = false;
         if (changeFiles) changeFiles.disabled = false;
         if (submit) submit.disabled = false;
     }
 
-    function batch() {
+    function batch(resume) {
         $.ajax({
             url: run.dataset.batch,
             type: 'POST',
             dataType: 'json',
-            data: { job: run.dataset.job }
+            data: { job: run.dataset.job, resume: resume ? '1' : '0' }
         }).done(function (result) {
             if (result.error) return stop(result.error);
             if (result.busy) {
                 if (++busyAttempts > 20) return stop();
-                return window.setTimeout(batch, 500);
+                return window.setTimeout(function () { batch(resume && !pause.disabled); }, 500);
             }
 
             busyAttempts = 0;
@@ -95,7 +129,7 @@
             progressBar.value = result.processed;
             var label = run.dataset.importing + ' ' + result.processed + ' / ' + result.total;
             summary.textContent = label;
-            info.textContent = label;
+            info.textContent = pause.disabled ? run.dataset.pausing : label;
             document.querySelectorAll('[data-npi-count]').forEach(function (count) {
                 count.textContent = result[count.dataset.npiCount];
             });
@@ -109,9 +143,19 @@
                 row.classList.toggle('npi-row-failed', update.status === 'failed');
             });
             if (result.done) {
+                window.removeEventListener('beforeunload', warnBeforeLeaving);
                 window.location.assign(run.dataset.return);
                 return;
             }
+            paused = result.paused;
+            if (paused) return stop(run.dataset.paused);
+            if (result.deferred) {
+                info.classList.remove('sr-only');
+                info.textContent = pause.disabled ? run.dataset.pausing : run.dataset.deferred;
+                if (++deferredAttempts > 10) return stop(run.dataset.deferred);
+                return window.setTimeout(batch, 1000);
+            }
+            deferredAttempts = 0;
             window.setTimeout(batch, 30);
         }).fail(function () {
             stop();
@@ -120,7 +164,17 @@
 
     run.addEventListener('click', function () {
         if (submit && submit.disabled) return;
-        if (!window.confirm(run.dataset.confirm)) return;
+        confirmation.modal('show');
+    });
+
+    document.getElementById('nothiz-confirm-accept').addEventListener('click', function () {
+        if (run.disabled || (submit && submit.disabled)) return;
+        confirmation.modal('hide');
+        busyAttempts = 0;
+        deferredAttempts = 0;
+        pause.disabled = false;
+        pause.hidden = false;
+        window.addEventListener('beforeunload', warnBeforeLeaving);
         run.disabled = true;
         run.hidden = true;
         filters.hidden = true;
@@ -137,6 +191,6 @@
         segments.hidden = true;
         progressBar.hidden = false;
         info.textContent = run.dataset.importing;
-        batch();
+        batch(paused);
     });
 }());

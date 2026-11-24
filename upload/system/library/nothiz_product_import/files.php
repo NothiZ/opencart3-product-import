@@ -1,5 +1,7 @@
 <?php
 
+require_once __DIR__ . '/issue.php';
+
 class NothizProductImportFiles {
     private const SHEET_NS = [
         'http://schemas.openxmlformats.org/spreadsheetml/2006/main',
@@ -21,6 +23,7 @@ class NothizProductImportFiles {
     ];
     private const XML_BYTES = 8 * 1024 * 1024;
     private const IMAGE_BYTES = 15 * 1024 * 1024;
+    private const IMAGE_HEADER_BYTES = 256 * 1024;
     public const WORKBOOK_BYTES = 24 * 1024 * 1024;
     public const IMAGE_ARCHIVE_BYTES = 320 * 1024 * 1024;
     private const EXPANDED_IMAGE_ARCHIVE_BYTES = 768 * 1024 * 1024;
@@ -31,7 +34,7 @@ class NothizProductImportFiles {
     /** @return array<int, array{row:int, data:array<string, string>}> */
     public static function readWorkbook(string $path): array {
         if (!class_exists('DOMDocument')) {
-            throw new RuntimeException('The PHP DOM extension is required.');
+            throw new NothizProductImportIssue('workbook_dom_required', [], 'The PHP DOM extension is required.');
         }
         $zip = self::openArchive($path, self::WORKBOOK_BYTES);
         try {
@@ -50,7 +53,7 @@ class NothizProductImportFiles {
             $sheets = self::firstChild($workbook, 'sheets');
             $sheet = $sheets ? self::firstChild($sheets, 'sheet') : null;
             if (!$sheet) {
-                throw new RuntimeException('The workbook does not contain a worksheet.');
+                throw new NothizProductImportIssue('workbook_worksheet_missing', [], 'The workbook does not contain a worksheet.');
             }
 
             $sheetId = '';
@@ -64,7 +67,7 @@ class NothizProductImportFiles {
             $relationshipPath = ($directory === '.' ? '' : $directory . '/') . '_rels/' . basename($workbookPath) . '.rels';
             $relationships = self::relationships(self::xml($zip, $relationshipPath, 'Relationships', self::PACKAGE_REL_NS), $workbookPath);
             if (!isset($relationships[$sheetId]) || $relationships[$sheetId]['type'] !== 'worksheet') {
-                throw new RuntimeException('The first workbook sheet must point to a worksheet inside the XLSX file.');
+                throw new NothizProductImportIssue('workbook_worksheet_target', [], 'The first workbook sheet must point to a worksheet inside the XLSX file.');
             }
 
             unset($workbook, $sheets, $sheet);
@@ -83,7 +86,7 @@ class NothizProductImportFiles {
             $worksheet = self::xml($zip, $relationships[$sheetId]['path'], 'worksheet', self::SHEET_NS);
             $sheetData = self::firstChild($worksheet, 'sheetData');
             if (!$sheetData) {
-                throw new RuntimeException('The first worksheet is missing its row data.');
+                throw new NothizProductImportIssue('workbook_rows_missing', [], 'The first worksheet is missing its row data.');
             }
             return self::workbookRows($sheetData, $strings);
         } finally {
@@ -101,7 +104,7 @@ class NothizProductImportFiles {
             $r = $element->getAttribute('r');
             $row = $r === '' ? $previousRow + 1 : (int)$r;
             if (($r !== '' && !preg_match('/^[1-9][0-9]{0,6}$/D', $r)) || $row <= $previousRow || $row > 1048576) {
-                throw new RuntimeException('The first worksheet contains an invalid row reference.');
+                throw new NothizProductImportIssue('workbook_row_reference', [], 'The first worksheet contains an invalid row reference.');
             }
             $previousRow = $row;
             if ($row !== 1 && !$headers) {
@@ -120,14 +123,14 @@ class NothizProductImportFiles {
                 $value = self::cellText($cell, $strings);
                 $cellBytes += strlen($value);
                 if (strlen($value) > 128 * 1024 || $cellBytes > 16 * 1024 * 1024) {
-                    throw new RuntimeException('The worksheet exceeds the maximum cell text size.');
+                    throw new NothizProductImportIssue('workbook_cell_size', [], 'The worksheet exceeds the maximum cell text size.');
                 }
 
                 if ($row === 1) {
                     $header = strtolower(trim($value));
                     if ($header !== '') {
                         if (in_array($header, $headers, true) || count($headers) >= 256) {
-                            throw new RuntimeException('Worksheet headers must be unique and there may be at most 256.');
+                            throw new NothizProductImportIssue('workbook_headers_invalid', [], 'Worksheet headers must be unique and there may be at most 256.');
                         }
                         $headers[$column] = $header;
                     }
@@ -142,11 +145,11 @@ class NothizProductImportFiles {
                 $defaults = array_fill_keys($headers, '');
             } elseif ($hasValues) {
                 if (count($rows) >= 10000) {
-                    throw new RuntimeException('A workbook may contain at most 10,000 product rows.');
+                    throw new NothizProductImportIssue('workbook_row_count', [], 'A workbook may contain at most 10,000 product rows.');
                 }
                 // Each returned row has entries for all headers, including sparse worksheet cells.
                 if (count($rows) >= intdiv(250000, count($headers))) {
-                    throw new RuntimeException('The workbook may contain at most 250,000 expanded cells.');
+                    throw new NothizProductImportIssue('workbook_cell_count', [], 'The workbook may contain at most 250,000 expanded cells.');
                 }
                 $rows[] = ['row' => $row, 'data' => $data];
             }
@@ -160,7 +163,7 @@ class NothizProductImportFiles {
     private static function requireHeaders(array $headers): void {
         $missing = array_diff(['sku', 'title', 'price', 'description'], $headers);
         if ($missing) {
-            throw new RuntimeException('The first worksheet is missing required headers: ' . implode(', ', $missing) . '.');
+            throw new NothizProductImportIssue('workbook_headers_missing', ['headers' => implode(', ', $missing)], 'The first worksheet is missing required headers.');
         }
     }
 
@@ -169,7 +172,7 @@ class NothizProductImportFiles {
         $column = $previous + 1;
         if ($reference !== '') {
             if (!preg_match('/^([A-Z]{1,3})([1-9][0-9]{0,6})$/D', $reference, $matches) || (int)$matches[2] !== $row) {
-                throw new RuntimeException('Invalid cell reference in worksheet row ' . $row . '.');
+                throw new NothizProductImportIssue('workbook_cell_reference', ['row' => $row], 'Invalid cell reference in the worksheet.');
             }
             $column = 0;
             foreach (str_split($matches[1]) as $letter) {
@@ -177,7 +180,7 @@ class NothizProductImportFiles {
             }
         }
         if ($column <= $previous || $column > 16384) {
-            throw new RuntimeException('Invalid column order in worksheet row ' . $row . '.');
+            throw new NothizProductImportIssue('workbook_column_order', ['row' => $row], 'Invalid column order in the worksheet.');
         }
         return $column;
     }
@@ -196,7 +199,7 @@ class NothizProductImportFiles {
         if ($type === 's') {
             $index = $value->textContent;
             if (!preg_match('/^[0-9]{1,7}$/D', $index) || !isset($strings[(int)$index])) {
-                throw new RuntimeException('The workbook contains an invalid shared string reference.');
+                throw new NothizProductImportIssue('workbook_shared_string', [], 'The workbook contains an invalid shared string reference.');
             }
             return $strings[(int)$index];
         }
@@ -246,7 +249,7 @@ class NothizProductImportFiles {
             }
             $id = $element->getAttribute('Id');
             if ($id === '' || isset($relationships[$id])) {
-                throw new RuntimeException('The workbook contains an invalid OOXML relationship ID.');
+                throw new NothizProductImportIssue('workbook_relationship_id', [], 'The workbook contains an invalid OOXML relationship ID.');
             }
             $relationships[$id] = ['type' => $name, 'path' => self::resolvePart($source, $element->getAttribute('Target'))];
         }
@@ -255,7 +258,7 @@ class NothizProductImportFiles {
 
     private static function resolvePart(string $source, string $target): string {
         if ($target === '' || strpbrk($target, '?#') !== false) {
-            throw new RuntimeException('The workbook contains an invalid OOXML relationship target.');
+            throw new NothizProductImportIssue('workbook_relationship_target', [], 'The workbook contains an invalid OOXML relationship target.');
         }
         $target = rawurldecode($target);
         $directory = $source === '' ? '.' : dirname($source);
@@ -267,11 +270,11 @@ class NothizProductImportFiles {
                 }
                 continue;
             }
-            self::assertPathPart($part);
+            self::assertPathPart($part, $target);
             $parts[] = $part;
         }
         if (!$parts) {
-            throw new RuntimeException('The workbook contains an empty OOXML relationship target.');
+            throw new NothizProductImportIssue('workbook_relationship_target', [], 'The workbook contains an empty OOXML relationship target.');
         }
         return implode('/', $parts);
     }
@@ -279,7 +282,7 @@ class NothizProductImportFiles {
     private static function xml(ZipArchive $zip, string $path, string $root, array $namespaces): DOMElement {
         $index = $zip->locateName($path);
         if ($index === false) {
-            throw new RuntimeException('The XLSX file is missing a required part: ' . $root . '.');
+            throw new NothizProductImportIssue('workbook_part_missing', ['part' => $root], 'The XLSX file is missing a required part.');
         }
         $xml = self::member($zip, $index, self::XML_BYTES);
         $doc = new DOMDocument();
@@ -287,125 +290,213 @@ class NothizProductImportFiles {
         if (!$doc->loadXML($xml, LIBXML_NONET | LIBXML_NOERROR | LIBXML_NOWARNING | LIBXML_COMPACT)
             || $doc->doctype !== null || !$doc->documentElement || $doc->documentElement->localName !== $root
             || !in_array($doc->documentElement->namespaceURI, $namespaces, true)) {
-            throw new RuntimeException('The XLSX file contains an invalid XML part: ' . $root . '.');
+            throw new NothizProductImportIssue('workbook_part_invalid', ['part' => $root], 'The XLSX file contains an invalid XML part.');
         }
         return $doc->documentElement;
     }
 
     // Image archive inspection
 
-    /** @return array<string, array{categories:string[], entries:string[]}> */
-    public static function inspectImages(string $path): array {
-        $zip = self::openArchive($path, self::IMAGE_ARCHIVE_BYTES);
+    public static function scanImages(string $path, ?array $state, string $imageRoot, bool $stripProducts, int $limit = 80): array {
+        $zip = self::openArchive($path, self::IMAGE_ARCHIVE_BYTES, false);
         try {
-            $files = [];
-            $seenNames = [];
-            $totalBytes = 0;
-            for ($index = 0; $index < $zip->numFiles; $index++) {
+            $count = $zip->numFiles;
+            $total = 2 * $count;
+            $state = $state ?? [
+                'processed' => 0,
+                'bytes' => 0,
+                'products' => false,
+                'other' => false,
+                'catalog_products' => false,
+                'other_catalog' => false,
+                'deep' => false,
+                'names' => [],
+                'folders' => [],
+                'groups' => [],
+                'issues' => [],
+                'warnings' => [],
+            ];
+            $root = self::imageRoot($imageRoot);
+            $end = min($total, $state['processed'] + max(1, min($limit, 200)));
+            $deadline = microtime(true) + 0.5;
+            // Check archive-wide limits and wrapper evidence before assigning any entries to rows.
+            do {
+                $position = $state['processed']++;
+                $index = $position % $count;
                 $stat = self::stat($zip, $index);
-                $name = $stat['name'];
-                $directory = substr($name, -1) === '/';
-                $parts = explode('/', $directory ? substr($name, 0, -1) : $name);
-                if (strlen($name) > 1000) {
-                    throw new RuntimeException('An archive path exceeds the maximum length.');
+                $path = $stat['name'];
+                $directory = substr($path, -1) === '/';
+                $parts = self::imagePathParts($path, $directory);
+                if ($position < $count) {
+                    $state['bytes'] += $stat['size'];
+                    if ($state['bytes'] > self::EXPANDED_IMAGE_ARCHIVE_BYTES) {
+                        throw new NothizProductImportIssue('archive_expanded', ['path' => $path], 'The image ZIP exceeds the maximum expanded size.');
+                    }
+                    if (!$directory && !self::imageJunk($parts) && self::isImageName($path) && count($parts) >= 3 && count($parts) <= 6) {
+                        $products = $parts[0] === 'products' && count($parts) >= 4 && count($parts) <= 5;
+                        $catalogProducts = array_slice($parts, 0, 2) === ['catalog', 'products'] && count($parts) >= 5;
+                        $state[$products ? 'products' : 'other'] = true;
+                        $state[$catalogProducts ? 'catalog_products' : 'other_catalog'] = true;
+                        $state['deep'] = $state['deep'] || count($parts) > 4;
+                    }
+                } elseif (!$directory) {
+                    self::scanImage($zip, $index, $stat, $parts, $root, $stripProducts, $state);
                 }
-                foreach ($parts as $part) {
-                    self::assertPathPart($part);
-                }
+            } while ($state['processed'] < $end && microtime(true) < $deadline);
 
-                $totalBytes += $stat['size'];
-                if ($stat['size'] > self::IMAGE_BYTES || $totalBytes > self::EXPANDED_IMAGE_ARCHIVE_BYTES) {
-                    throw new RuntimeException('The image ZIP exceeds the maximum expanded size.');
-                }
-                $fileName = end($parts);
-                if ($directory || $parts[0] === '__MACOSX' || in_array($fileName, ['.DS_Store', 'Thumbs.db', 'desktop.ini'], true)
-                    || strpos($fileName, '._') === 0) {
-                    continue;
-                }
-
-                if (isset($seenNames[$name])) {
-                    throw new RuntimeException('The image ZIP repeats an image path.');
-                }
-                $seenNames[$name] = true;
-                self::image($zip, $index, $stat);
-                $files[] = ['name' => $name, 'parts' => $parts];
-            }
-            if (!$files) {
-                throw new RuntimeException('The image ZIP does not contain any supported images.');
-            }
-
-            $prefixLength = self::imagePrefixLength($files);
-            $images = [];
-            $folders = [];
-            foreach ($files as $file) {
-                $parts = array_slice($file['parts'], $prefixLength);
-                if (count($parts) !== 3 && count($parts) !== 4) {
-                    throw new RuntimeException('Use category/SKU/image or parent/child/SKU/image folders in the image ZIP.');
-                }
-                array_pop($parts);
-                $sku = array_pop($parts);
-                if (isset($folders[$sku]) && $folders[$sku] !== $parts) {
-                    throw new RuntimeException('The image ZIP contains the same SKU in multiple folders: ' . $sku . '.');
-                }
-                $folders[$sku] = $parts;
-                $images[$sku]['categories'] = $parts;
-                $images[$sku]['entries'][] = $file['name'];
-                if (count($images[$sku]['entries']) > 100) {
-                    throw new RuntimeException('The image ZIP may contain at most 100 images per SKU.');
-                }
-            }
-            foreach ($images as &$item) {
-                sort($item['entries'], SORT_STRING);
-            }
-            unset($item);
-            return $images;
+            $done = $state['processed'] === $total;
+            return [
+                'done' => $done,
+                'processed' => $state['processed'],
+                'total' => $total,
+                'state' => $done ? null : $state,
+                'index' => !$done ? null : [
+                    'groups' => $state['groups'],
+                    'issues' => $state['issues'],
+                    'warnings' => $state['warnings'],
+                    'outer_products' => $state['products'] && !$state['other'],
+                ],
+            ];
         } finally {
             $zip->close();
         }
     }
 
-    private static function imagePrefixLength(array $files): int {
-        // Strip a common wrapper only when the raw image paths cannot already form valid SKU folders.
-        $validRawPaths = true;
-        foreach ($files as $file) {
-            if (count($file['parts']) > 4) {
-                $validRawPaths = false;
-                break;
-            }
+    /** @return array<string, array{categories:string[], entries:string[]}> */
+    public static function inspectImages(string $path): array {
+        $state = null;
+        do {
+            $result = self::scanImages($path, $state, dirname($path), false);
+            $state = $result['state'];
+        } while (!$result['done']);
+        return $result['index']['groups'];
+    }
+
+    private static function scanImage(ZipArchive $zip, int $index, array $stat, array $parts, string $root, bool $stripProducts, array &$state): void {
+        $path = $stat['name'];
+        if (self::imageJunk($parts) || !self::isImageName($path)) {
+            $state['warnings'][] = ['code' => 'image_ignored', 'params' => ['path' => $path]];
+            return;
         }
-        if ($validRawPaths) {
-            return 0;
+        if ($state['catalog_products'] && !$state['other_catalog'] && $state['deep'] && array_slice($parts, 0, 2) === ['catalog', 'products']) {
+            $parts = array_slice($parts, 2);
+        } elseif ($stripProducts && $state['products'] && !$state['other'] && $parts[0] === 'products') {
+            $parts = array_slice($parts, 1);
         }
-        foreach ([['catalog', 'products'], ['products']] as $prefix) {
-            $length = count($prefix);
-            foreach ($files as $file) {
-                if (array_slice($file['parts'], 0, $length) !== $prefix
-                    || !in_array(count($file['parts']) - $length, [3, 4], true)) {
-                    continue 2;
+        array_pop($parts);
+        $sku = array_pop($parts);
+        $key = $sku === null ? '' : self::foldPath($sku);
+        $pathKey = hash('sha256', self::foldPath($path));
+        try {
+            if (array_key_exists($pathKey, $state['names'])) {
+                $error = new NothizProductImportIssue('image_duplicate', ['path' => $path], 'The image ZIP repeats an image path.');
+                $otherSku = $state['names'][$pathKey];
+                if ($otherSku !== null && $otherSku !== $sku) {
+                    $state['issues'][$otherSku][] = $error->issue();
+                    unset($state['groups'][$otherSku]);
                 }
+                throw $error;
             }
-            return $length;
+            $state['names'][$pathKey] = $sku;
+            if (count($parts) !== 1 && count($parts) !== 2) {
+                throw new NothizProductImportIssue('image_layout', ['path' => $path], 'Use category/SKU/image or parent/child/SKU/image folders in the image ZIP.');
+            }
+            if (isset($state['folders'][$key]) && $state['folders'][$key] !== [$sku, $parts]) {
+                $otherSku = $state['folders'][$key][0];
+                $error = new NothizProductImportIssue('image_folders', ['path' => $path, 'sku' => $sku], 'The image ZIP contains the same SKU in multiple folders.');
+                if ($otherSku !== $sku) {
+                    $state['issues'][$otherSku][] = $error->issue();
+                    unset($state['groups'][$otherSku]);
+                }
+                throw $error;
+            }
+            $state['folders'][$key] = [$sku, $parts];
+            if (isset($state['issues'][$sku])) {
+                return;
+            }
+            if (count($state['groups'][$sku]['entries'] ?? []) >= 100) {
+                throw new NothizProductImportIssue('image_count', ['path' => $path, 'sku' => $sku], 'The image ZIP may contain at most 100 images per SKU.');
+            }
+            if ($stat['size'] < 1 || $stat['size'] > self::IMAGE_BYTES) {
+                throw new NothizProductImportIssue('archive_entry_size', ['path' => $path], 'An archive entry is empty or exceeds the maximum expanded size.');
+            }
+            $extension = self::imageExtension($path);
+            $header = @$zip->getFromIndex($index, min(self::IMAGE_HEADER_BYTES, $stat['size']));
+            self::validateImageHeader($path, $extension, $header === false ? '' : $header, $stat['size'] > self::IMAGE_HEADER_BYTES);
+            $destination = self::imageFile($root, $path);
+            if ($destination !== null && file_exists($destination)) {
+                if (@filesize($destination) !== $stat['size']) {
+                    throw self::imageConflict($path);
+                }
+                try {
+                    $archiveHash = hash('sha256', self::member($zip, $index, self::IMAGE_BYTES, $stat));
+                } catch (NothizProductImportIssue $error) {
+                    throw new NothizProductImportIssue('image_type', ['path' => $path], 'The image cannot be read completely.');
+                }
+                if (!self::matchingFile($destination, $stat['size'], $archiveHash)) {
+                    throw self::imageConflict($path);
+                }
+                $state['groups'][$sku]['reused'] = ($state['groups'][$sku]['reused'] ?? 0) + 1;
+            }
+            $state['groups'][$sku]['categories'] = $parts;
+            $state['groups'][$sku]['entries'][] = $path;
+            usort($state['groups'][$sku]['entries'], static function (string $left, string $right): int {
+                return strnatcasecmp($left, $right) ?: strcmp($left, $right);
+            });
+        } catch (NothizProductImportIssue $error) {
+            if ($sku === null) {
+                $state['warnings'][] = $error->issue();
+            } else {
+                $state['issues'][$sku][] = $error->issue();
+                unset($state['groups'][$sku]);
+            }
         }
-        return 0;
+    }
+
+    private static function foldPath(string $path): string {
+        return function_exists('mb_strtolower') ? mb_strtolower($path, 'UTF-8') : strtolower($path);
+    }
+
+    private static function imageJunk(array $parts): bool {
+        $name = end($parts);
+        return $parts[0] === '__MACOSX' || in_array($name, ['.DS_Store', 'Thumbs.db', 'desktop.ini'], true) || strpos($name, '._') === 0;
+    }
+
+    private static function isImageName(string $path): bool {
+        return isset(self::IMAGE_TYPES[strtolower(pathinfo($path, PATHINFO_EXTENSION))]);
+    }
+
+    private static function imageExtension(string $path): string {
+        $extension = strtolower(pathinfo($path, PATHINFO_EXTENSION));
+        if (!isset(self::IMAGE_TYPES[$extension])) {
+            throw new NothizProductImportIssue('image_type', ['path' => $path], 'The image ZIP supports JPG, JPEG, PNG and WebP images.');
+        }
+        if ($extension === 'webp' && defined('VERSION') && version_compare(VERSION, '3.0.3.9', '<')) {
+            throw new NothizProductImportIssue('image_webp', ['path' => $path], 'Convert WebP images to JPG or PNG for OpenCart versions before 3.0.3.9.');
+        }
+        return $extension;
+    }
+
+    private static function validateImageHeader(string $path, string $extension, string $bytes, bool $partial = false): void {
+        $image = @getimagesizefromstring($bytes);
+        // A JPEG can have more metadata than the preview reads before its frame header.
+        if (!$image && $partial && self::IMAGE_TYPES[$extension] === IMAGETYPE_JPEG && substr($bytes, 0, 3) === "\xff\xd8\xff") {
+            return;
+        }
+        if (!$image || $image[2] !== self::IMAGE_TYPES[$extension] || $image[0] < 1 || $image[1] < 1
+            || $image[0] > intdiv(16000000, $image[1])) {
+            throw new NothizProductImportIssue('image_type', ['path' => $path], 'Invalid image type or dimensions.');
+        }
     }
 
     private static function image(ZipArchive $zip, int $index, array $stat): array {
-        $extension = strtolower(pathinfo($stat['name'], PATHINFO_EXTENSION));
-        if (!isset(self::IMAGE_TYPES[$extension])) {
-            throw new RuntimeException('The image ZIP may contain only JPG, JPEG, PNG or WebP images.');
-        }
-        if ($extension === 'webp' && defined('VERSION') && version_compare(VERSION, '3.0.3.9', '<')) {
-            throw new RuntimeException('Convert WebP images to JPG or PNG for OpenCart versions before 3.0.3.9.');
-        }
+        $path = $stat['name'];
+        $extension = self::imageExtension($path);
         $bytes = self::member($zip, $index, self::IMAGE_BYTES, $stat);
-        $image = @getimagesizefromstring($bytes);
-        if (!$image || $image[2] !== self::IMAGE_TYPES[$extension] || $image[0] < 1 || $image[1] < 1
-            || $image[0] > intdiv(16000000, $image[1])) {
-            throw new RuntimeException('Invalid image type or dimensions: ' . $stat['name'] . '.');
-        }
+        self::validateImageHeader($path, $extension, $bytes);
         // A valid header can still precede truncated image data. Decode before it reaches OpenCart's resizer.
         if (!function_exists('imagecreatefromstring') || @imagecreatefromstring($bytes) === false) {
-            throw new RuntimeException('The image could not be decoded by PHP GD: ' . $stat['name'] . '.');
+            throw new NothizProductImportIssue('image_decode', ['path' => $path], 'The image could not be decoded by PHP GD.');
         }
         return [$extension, $bytes];
     }
@@ -413,15 +504,15 @@ class NothizProductImportFiles {
     // Publishing and rollback
 
     /** @return string[] Paths relative to the OpenCart image directory. */
-    public static function publishImages(string $zipPath, array $entries, string $imageRoot, string $jobId, int $row): array {
+    public static function publishImages(string $zipPath, array $entries, string $imageRoot, string $jobId, int $row, ?array &$publication = null): array {
         if (!$entries || count($entries) > 100) {
             throw new RuntimeException('Invalid list of images to publish.');
         }
-        $relative = self::imageDestination($jobId, $row);
-        $imageRoot = realpath($imageRoot);
-        if ($imageRoot === false || !is_dir($imageRoot)) {
-            throw new RuntimeException('The OpenCart image directory is unavailable.');
+        if ($publication !== null) {
+            return self::publishOriginalImages($zipPath, $entries, self::imageRoot($imageRoot), $publication);
         }
+        $relative = self::imageDestination($jobId, $row);
+        $imageRoot = self::imageRoot($imageRoot);
         $zip = self::openArchive($zipPath, self::IMAGE_ARCHIVE_BYTES);
         $paths = [];
         $rowDirectory = '';
@@ -466,6 +557,169 @@ class NothizProductImportFiles {
             throw $error;
         } finally {
             $zip->close();
+        }
+    }
+
+    private static function publishOriginalImages(string $zipPath, array $entries, string $root, array &$publication): array {
+        $publication = [];
+        $zip = self::openArchive($zipPath, self::IMAGE_ARCHIVE_BYTES, false);
+        $paths = [];
+        $created = [];
+        try {
+            foreach ($entries as $entry) {
+                $file = self::imageFile($root, $entry);
+                $index = $zip->locateName($entry);
+                if ($index === false) {
+                    throw new NothizProductImportIssue('image_missing', ['path' => $entry], 'An image selected for import is missing from the ZIP.');
+                }
+                [, $bytes] = self::image($zip, $index, self::stat($zip, $index));
+                $size = strlen($bytes);
+                $sha256 = hash('sha256', $bytes);
+                $relative = self::IMPORT_IMAGE_PATH . '/' . $entry;
+                if ($file !== null && file_exists($file)) {
+                    if (!self::matchingFile($file, $size, $sha256)) {
+                        throw self::imageConflict($entry);
+                    }
+                } else {
+                    $file = self::imageFile($root, $entry, true);
+                    $record = self::writeImage($root, $file, $entry, $bytes, $sha256);
+                    if ($record !== null) {
+                        $created[] = ['path' => $relative] + $record;
+                    }
+                }
+                $paths[] = $relative;
+            }
+            $publication = $created;
+            return $paths;
+        } catch (Throwable $error) {
+            self::discardPublishedImages($created, $root);
+            throw $error;
+        } finally {
+            $zip->close();
+        }
+    }
+
+    private static function writeImage(string $root, string $file, string $entry, string $bytes, string $sha256): ?array {
+        $directory = dirname($file);
+        $temporary = @tempnam($directory, 'npi-');
+        if ($temporary === false) {
+            throw self::imagePublishError($entry);
+        }
+        try {
+            $size = strlen($bytes);
+            if (realpath(dirname($temporary)) !== realpath($directory) || @file_put_contents($temporary, $bytes) !== $size
+                || !@chmod($temporary, 0644) || !($stat = @stat($temporary))) {
+                throw self::imagePublishError($entry);
+            }
+            // Linking exposes the complete file atomically and fails if the destination is already occupied.
+            if (self::imageFile($root, $entry) === $file && function_exists('link') && @link($temporary, $file)) {
+                return ['size' => $size, 'sha256' => $sha256, 'dev' => (int)$stat['dev'], 'ino' => (int)$stat['ino']];
+            }
+            $existing = self::imageFile($root, $entry);
+            if ($existing !== null && file_exists($existing)) {
+                if (self::matchingFile($existing, $size, $sha256)) {
+                    return null;
+                }
+                throw self::imageConflict($entry);
+            }
+            throw self::imagePublishError($entry);
+        } finally {
+            @unlink($temporary);
+        }
+    }
+
+    private static function imageRoot(string $path): string {
+        $root = realpath($path);
+        if ($root === false || !is_dir($root)) {
+            throw new NothizProductImportIssue('image_root', [], 'The OpenCart image directory is unavailable.');
+        }
+        return $root;
+    }
+
+    private static function imagePathParts(string $path, bool $directory = false): array {
+        if (strlen($path) > 1000) {
+            throw new NothizProductImportIssue('archive_path_length', ['path' => self::displayArchivePath($path)], 'An archive path exceeds the maximum length.');
+        }
+        $parts = explode('/', $directory ? substr($path, 0, -1) : $path);
+        foreach ($parts as $part) {
+            self::assertPathPart($part, $path);
+            if (preg_match('/[<>"|?*]|^ |[. ]$|^(?:CON(?:IN\$|OUT\$)?|PRN|AUX|NUL|(?:COM|LPT)[1-9¹²³]) *(?:\.|$)/iuD', $part)) {
+                throw new NothizProductImportIssue('archive_path', ['path' => self::displayArchivePath($path)], 'The archive contains an unsafe path.');
+            }
+        }
+        return $parts;
+    }
+
+    private static function imageFile(string $root, string $entry, bool $create = false): ?string {
+        $parts = self::imagePathParts($entry);
+        $name = array_pop($parts);
+        if (preg_match('/\.(?:php[0-9]*|phps|phtml?|phar|cgi|pl|py|shtml|asp[x]?|jsp[x]?)\./i', $name)) {
+            // Apache can apply a handler based on a secondary filename extension.
+            throw new NothizProductImportIssue('image_extension_unsafe', ['path' => $entry], 'The image filename contains an executable secondary extension.');
+        }
+        $relative = self::IMPORT_IMAGE_PATH . '/' . $entry;
+        if (preg_match('/^.{256}/us', $relative)) {
+            throw new NothizProductImportIssue('image_path_length', ['path' => $entry], 'The image path exceeds the OpenCart image column length.');
+        }
+        foreach (array_merge(explode('/', self::IMPORT_IMAGE_PATH), $parts) as $part) {
+            $root .= '/' . $part;
+            clearstatcache(true, $root);
+            if (is_link($root) || (file_exists($root) && !is_dir($root))) {
+                throw self::imageConflict($entry);
+            }
+            if (!is_dir($root)) {
+                if (!$create) {
+                    return null;
+                }
+                if (!@mkdir($root, 0755) && !is_dir($root)) {
+                    throw self::imagePublishError($entry);
+                }
+                if (is_link($root)) {
+                    throw self::imageConflict($entry);
+                }
+            }
+        }
+        $file = $root . '/' . $name;
+        clearstatcache(true, $file);
+        if (is_link($file) || (file_exists($file) && !is_file($file))) {
+            throw self::imageConflict($entry);
+        }
+        return $file;
+    }
+
+    private static function matchingFile(string $file, int $size, string $sha256): bool {
+        clearstatcache(true, $file);
+        return !is_link($file) && is_file($file) && @filesize($file) === $size && @hash_file('sha256', $file) === $sha256;
+    }
+
+    private static function imageConflict(string $entry): NothizProductImportIssue {
+        return new NothizProductImportIssue('image_conflict', ['path' => $entry], 'An existing image path contains different bytes or an unexpected entry.');
+    }
+
+    private static function imagePublishError(string $entry): NothizProductImportIssue {
+        return new NothizProductImportIssue('image_publish', ['path' => $entry], 'Unable to publish the complete import image file.');
+    }
+
+    public static function discardPublishedImages(array $publication, string $imageRoot): void {
+        $root = realpath($imageRoot);
+        if ($root === false) {
+            return;
+        }
+        $prefix = self::IMPORT_IMAGE_PATH . '/';
+        foreach ($publication as $record) {
+            if (strpos($record['path'], $prefix) !== 0) {
+                continue;
+            }
+            try {
+                $file = self::imageFile($root, substr($record['path'], strlen($prefix)));
+                $stat = $file === null ? false : @lstat($file);
+                if ($stat && (int)$stat['dev'] === $record['dev'] && (int)$stat['ino'] === $record['ino']
+                    && self::matchingFile($file, $record['size'], $record['sha256'])) {
+                    @unlink($file);
+                }
+            } catch (NothizProductImportIssue $error) {
+                continue;
+            }
         }
     }
 
@@ -541,21 +795,22 @@ class NothizProductImportFiles {
 
     // Shared archive validation
 
-    private static function openArchive(string $path, int $maxBytes): ZipArchive {
+    private static function openArchive(string $path, int $maxBytes, bool $checkConsistency = true): ZipArchive {
         if (!class_exists('ZipArchive')) {
-            throw new RuntimeException('The PHP ZIP extension is required.');
+            throw new NothizProductImportIssue('archive_zip_required', [], 'The PHP ZIP extension is required.');
         }
         $size = @filesize($path);
         if ($size === false || $size < 1 || $size > $maxBytes) {
-            throw new RuntimeException('The archive is unreadable, empty, or exceeds the maximum upload size.');
+            throw new NothizProductImportIssue('archive_size', [], 'The archive is unreadable, empty, or exceeds the maximum upload size.');
         }
         $zip = new ZipArchive();
-        if (@$zip->open($path, ZipArchive::CHECKCONS) !== true) {
-            throw new RuntimeException('Unable to open the ZIP or XLSX file.');
+        // Resumable scans validate entries in batches. CHECKCONS reads all local headers on every open.
+        if (@$zip->open($path, $checkConsistency ? ZipArchive::CHECKCONS : 0) !== true) {
+            throw new NothizProductImportIssue('archive_open', [], 'Unable to open the ZIP or XLSX file.');
         }
         if ($zip->numFiles < 1 || $zip->numFiles > 10000) {
             $zip->close();
-            throw new RuntimeException('The archive must contain between 1 and 10,000 entries.');
+            throw new NothizProductImportIssue('archive_entries', [], 'The archive must contain between 1 and 10,000 entries.');
         }
         return $zip;
     }
@@ -566,7 +821,7 @@ class NothizProductImportFiles {
         if (!$stat || $stat['size'] < 0 || !empty($stat['encryption_method'])
             || ($zip->getExternalAttributesIndex($index, $system, $mode) && $system === 3
                 && !in_array(($mode >> 16) & 0170000, [0, 0040000, 0100000], true))) {
-            throw new RuntimeException('The archive contains an encrypted, linked, or invalid entry.');
+            throw new NothizProductImportIssue('archive_entry', ['path' => self::displayArchivePath($stat['name'] ?? '')], 'The archive contains an encrypted, linked, or invalid entry.');
         }
         return $stat;
     }
@@ -574,19 +829,26 @@ class NothizProductImportFiles {
     private static function member(ZipArchive $zip, int $index, int $maxBytes, ?array $stat = null): string {
         $stat = $stat ?? self::stat($zip, $index);
         if ($stat['size'] < 1 || $stat['size'] > $maxBytes) {
-            throw new RuntimeException('An archive entry is empty or exceeds the maximum expanded size.');
+            throw new NothizProductImportIssue('archive_entry_size', ['path' => $stat['name']], 'An archive entry is empty or exceeds the maximum expanded size.');
         }
         $bytes = @$zip->getFromIndex($index, $stat['size'] + 1);
         if ($bytes === false || strlen($bytes) !== $stat['size']) {
-            throw new RuntimeException('An archive entry could not be read completely.');
+            throw new NothizProductImportIssue('archive_entry_read', ['path' => $stat['name']], 'An archive entry could not be read completely.');
         }
         return $bytes;
     }
 
-    private static function assertPathPart(string $part): void {
+    private static function assertPathPart(string $part, string $path): void {
         if ($part === '' || $part === '.' || $part === '..' || strlen($part) > 255
             || !preg_match('//u', $part) || preg_match('/[\x00-\x1f\x7f\\\\:]/', $part)) {
-            throw new RuntimeException('The archive contains an unsafe path.');
+            throw new NothizProductImportIssue('archive_path', ['path' => self::displayArchivePath($path)], 'The archive contains an unsafe path.');
         }
+    }
+
+    private static function displayArchivePath(string $path): string {
+        if (strlen($path) > 1024) {
+            $path = substr($path, 0, 1024) . '…';
+        }
+        return addcslashes($path, "\0..\37\177");
     }
 }

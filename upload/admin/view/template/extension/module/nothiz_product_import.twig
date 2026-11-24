@@ -27,10 +27,11 @@
     {% endif %}
 
     {% if can_modify %}
-      <section class="npi-panel" id="nothiz-upload-panel" aria-labelledby="nothiz-upload-title"{% if job and not error %} hidden{% endif %}>
+      <section class="npi-panel" id="nothiz-upload-panel" aria-labelledby="nothiz-upload-title"{% if job and not error and not pending_scan %} hidden{% endif %}>
         <div class="npi-panel-heading"><h2 id="nothiz-upload-title">{{ text.text_upload|e }}</h2></div>
         <form id="nothiz-upload" class="npi-panel-body" action="{{ action|e('html_attr') }}" method="post"
           data-begin="{{ begin_upload_url|e('html_attr') }}" data-chunk="{{ upload_chunk_url|e('html_attr') }}" data-plan="{{ plan_upload_url|e('html_attr') }}"
+          data-scan="{{ scan_url|e('html_attr') }}" data-scanning="{{ text.text_scanning_archive|e('html_attr') }}" data-pending-scan="{{ pending_scan|e('html_attr') }}"
           data-upload-workbook="{{ text.text_upload_workbook|e('html_attr') }}" data-upload-images="{{ text.text_upload_images|e('html_attr') }}"
           data-upload-checking="{{ text.text_upload_checking|e('html_attr') }}" data-check-archive="{{ text.text_check_archive|e('html_attr') }}"
           data-archive-reused="{{ text.text_archive_reused|e('html_attr') }}" data-catalog-reused="{{ text.text_catalog_reused|e('html_attr') }}"
@@ -68,6 +69,9 @@
             <button type="submit" class="npi-button npi-button--primary">
               {{ text.button_preflight|e }} <i class="fa fa-arrow-right" aria-hidden="true"></i>
             </button>
+            <button id="nothiz-resume-scan" type="button" class="npi-button npi-button--secondary"{% if not pending_scan %} hidden{% endif %}>
+              {{ text.button_resume_scan|e }}
+            </button>
             <span class="npi-muted">{{ text.text_check_hint|e }}</span>
           </div>
           <p id="nothiz-upload-status" class="npi-live-message" role="status" aria-live="polite"></p>
@@ -79,6 +83,7 @@
     {% if job %}
       <section class="npi-panel" id="nothiz-result-panel" aria-labelledby="nothiz-result-title"
         data-import-title="{{ text.text_import_title|e('html_attr') }}" data-import-hint="{{ text.text_keep_open|e('html_attr') }}" data-paused-title="{{ text.text_paused|e('html_attr') }}"
+        data-resume-hint="{{ text.text_resume_hint|e('html_attr') }}"
         data-created="{{ text.status_created|e('html_attr') }}" data-skipped="{{ text.status_skipped|e('html_attr') }}" data-failed="{{ text.status_failed|e('html_attr') }}">
         <div class="npi-panel-heading npi-panel-heading--split">
           <h2 id="nothiz-result-title">
@@ -87,15 +92,15 @@
           <div class="npi-result-meta">
             <span>{{ workbook_name|e }}{% if images_name %} · {{ images_name|e }}{% endif %}</span>
             {% if can_modify %}
-              <button type="button" class="npi-text-button" data-npi-change data-phase="{{ phase }}" aria-controls="nothiz-upload-panel" aria-expanded="{{ error ? 'true' : 'false' }}">
+              <button type="button" class="npi-text-button" data-npi-change data-phase="{{ phase }}" aria-controls="nothiz-upload-panel" aria-expanded="{{ (error or pending_scan) ? 'true' : 'false' }}">
                 {{ phase == 4 ? text.button_next|e : text.button_change|e }}
               </button>
             {% endif %}
           </div>
         </div>
         <div class="npi-panel-body">
-          <div id="nothiz-result-banner" class="npi-banner {% if phase == 3 %}npi-banner--info{% elseif summary.failed > 0 or (phase == 2 and summary.ready == 0) %}npi-banner--warning{% else %}npi-banner--success{% endif %}">
-            <i id="nothiz-result-icon" class="fa {% if phase == 3 %}fa-info-circle{% elseif summary.failed > 0 or (phase == 2 and summary.ready == 0) %}fa-exclamation-circle{% else %}fa-check-circle{% endif %}" aria-hidden="true"></i>
+          <div id="nothiz-result-banner" class="npi-banner {% if phase == 3 %}npi-banner--info{% elseif summary.failed > 0 or summary.duplicate > 0 or (phase == 2 and summary.ready == 0) %}npi-banner--warning{% else %}npi-banner--success{% endif %}">
+            <i id="nothiz-result-icon" class="fa {% if phase == 3 %}fa-info-circle{% elseif summary.failed > 0 or summary.duplicate > 0 or (phase == 2 and summary.ready == 0) %}fa-exclamation-circle{% else %}fa-check-circle{% endif %}" aria-hidden="true"></i>
             <div>
               <h3 id="nothiz-summary-title">
                 {% if phase == 4 %}{{ summary.created == 1 ? text.text_created_one|e : text.text_created_count|format(summary.created)|e }}
@@ -117,8 +122,28 @@
               {{ image_source == 'cache' ? text.text_archive_reused|e : text.text_catalog_reused|e }}
             </p>
           {% endif %}
+          {% if outer_products %}
+            <div class="npi-instructions">
+              <p>{{ (strip_products ? text.text_products_excluded : text.text_outer_products)|e }}</p>
+              {% if can_modify and phase == 2 and not pending_scan %}
+                <button id="nothiz-wrapper" type="button" class="npi-button npi-button--secondary"
+                  data-job="{{ job_id|e('html_attr') }}" data-strip="{{ strip_products ? '0' : '1' }}">
+                  {{ (strip_products ? text.button_keep_products : text.button_strip_products)|e }}
+                </button>
+                <p id="nothiz-wrapper-status" class="npi-live-message" role="status"></p>
+              {% endif %}
+            </div>
+          {% endif %}
+          {% if warnings %}
+            <details class="npi-instructions">
+              <summary>{{ text.text_archive_warnings|format(warnings|length)|e }}</summary>
+              <ul>
+                {% for warning in warnings %}<li>{{ warning|e }}</li>{% endfor %}
+              </ul>
+            </details>
+          {% endif %}
           <div class="npi-segments" id="nothiz-segments" aria-hidden="true">
-            {% for state in ['created', 'ready', 'skipped', 'failed'] %}
+            {% for state in ['created', 'ready', 'skipped', 'duplicate', 'failed'] %}
               {% if attribute(summary, state) > 0 %}
                 <span class="npi-fill--{{ state }}" style="flex-grow:{{ attribute(summary, state) }}"></span>
               {% endif %}
@@ -127,7 +152,7 @@
           <progress class="npi-progress" id="nothiz-progress-bar" max="{{ summary.total }}" value="{{ summary.processed }}" aria-label="{{ text.text_importing|e('html_attr') }}" hidden></progress>
 
           <ul class="npi-totals">
-            {% for state in ['ready', 'created', 'skipped', 'failed'] %}
+            {% for state in ['ready', 'created', 'skipped', 'duplicate', 'failed'] %}
               <li data-npi-total="{{ state }}"{% if (state == 'created' and phase < 3) or (state == 'ready' and phase == 4) %} hidden{% endif %}>
                 <span class="npi-dot npi-fill--{{ state }}" aria-hidden="true"></span>
                 <strong data-npi-count="{{ state }}">{{ attribute(summary, state) }}</strong>
@@ -140,11 +165,32 @@
             {% if can_modify and not error and summary.ready and not summary.done %}
               <button id="nothiz-run" type="button" class="npi-button npi-button--primary"
                 data-batch="{{ batch_url|e('html_attr') }}" data-return="{{ action|e('html_attr') }}"
-                data-job="{{ job_id|e('html_attr') }}" data-confirm="{{ text.text_confirm|e('html_attr') }}"
+                data-job="{{ job_id|e('html_attr') }}" data-pause="{{ pause_url|e('html_attr') }}"
+                data-is-paused="{{ paused ? '1' : '0' }}" data-resume="{{ text.button_resume|e('html_attr') }}" data-pausing="{{ text.text_pausing|e('html_attr') }}"
+                data-paused="{{ text.text_paused_hint|e('html_attr') }}" data-deferred="{{ text.text_waiting_catalog|e('html_attr') }}"
                 data-importing="{{ text.text_importing|e('html_attr') }}" data-error="{{ text.error_batch|e('html_attr') }}">
                 {% if phase == 3 %}{{ text.button_resume|e }}{% elseif summary.ready == 1 %}{{ text.button_import_one|e }}{% else %}{{ text.button_import_count|format(summary.ready)|e }}{% endif %}
                 <i class="fa fa-arrow-right" aria-hidden="true"></i>
               </button>
+            {% endif %}
+            {% if can_modify and not error and summary.ready and not summary.done %}
+              <button id="nothiz-pause" type="button" class="npi-button npi-button--secondary" hidden>
+                <i class="fa fa-pause" aria-hidden="true"></i>{{ text.button_pause|e }}
+              </button>
+              <div class="modal fade" id="nothiz-confirm-modal" tabindex="-1" role="dialog" aria-labelledby="nothiz-confirm-title">
+                <div class="modal-dialog" role="document">
+                  <div class="modal-content">
+                    <div class="modal-header">
+                      <h3 class="modal-title" id="nothiz-confirm-title">{{ text.text_confirm_title|e }}</h3>
+                    </div>
+                    <div class="modal-body"><p>{{ text.text_confirm|e }}</p></div>
+                    <div class="modal-footer">
+                      <button type="button" class="npi-button npi-button--secondary" data-dismiss="modal">{{ text.button_cancel_import|e }}</button>
+                      <button id="nothiz-confirm-accept" type="button" class="npi-button npi-button--primary">{{ text.button_confirm_import|e }}</button>
+                    </div>
+                  </div>
+                </div>
+              </div>
             {% endif %}
             {% if phase == 4 and summary.created and products_url %}
               <a class="npi-button npi-button--primary" href="{{ products_url|e('html_attr') }}">{{ text.button_products|e }}</a>
@@ -203,6 +249,6 @@
   </div>
 </div>
 <script src="view/javascript/nothiz/sha256.min.js?v=0.11.1"></script>
-<script src="view/javascript/nothiz_product_import_upload.js?v=4"></script>
-<script src="view/javascript/nothiz_product_import_ui.js?v=3"></script>
+<script src="view/javascript/nothiz_product_import_upload.js?v=5"></script>
+<script src="view/javascript/nothiz_product_import_ui.js?v=5"></script>
 {{ footer }}
